@@ -986,6 +986,7 @@ pub enum RendererPreference {
     Glsl3,      // 强制 OpenGL 3.3
     Gles2,      // 强制 GLES2（自动启用 DSB 如果支持）
     Gles2Pure,  // 纯 GLES2（禁用 DSB）
+}
 ```
 
 ---
@@ -1489,15 +1490,21 @@ pub fn make_current(&mut self) {
 }
 ```
 
-#### 4.6.2 GPU 重置恢复
+#### 4.6.2 GPU 重置恢复（尽力而为机制）
 
-当 GPU 上下文丢失（如驱动崩溃、TTDR 等）时，Alacritty 能自动恢复：
+当 GPU 上下文丢失（如驱动崩溃、TTDR 等）时，Alacritty 会**尝试**自动恢复，但这是一种"尽力而为"的机制，存在诸多限制：
 
+**恢复流程**（仅在支持 `GL_KHR_robustness` 扩展时可用）：
 1. 检测到 `ContextLost` 或 `GUILTY_CONTEXT_RESET_KHR`
-2. 重建 GL 上下文
-3. 重建 Renderer（重新编译 shader）
+2. 重建 GL 上下文（失败则 panic）
+3. 重建 Renderer（重新编译 shader，使用原渲染器偏好，不降级，失败则 panic）
 4. 重置字形缓存
 5. 标记全屏损伤，触发完整重绘
+
+> ⚠️ **重要限制**：
+> - 不支持 `GL_KHR_robustness` 扩展时，无法检测 GPU 重置
+> - 重建 GL 上下文或 Renderer 失败时，程序直接 panic 崩溃
+> - 重建时使用原渲染器偏好，不存在"GLSL3 失败回退到 GLES2"的降级逻辑
 
 ### 4.7 渲染更新的两阶段提交
 
