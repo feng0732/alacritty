@@ -401,38 +401,131 @@ fn validate_hint_highlights(&mut self, display_offset: usize) {
 | `vi_highlighted_hint_age` | **递增 1** | 每次 draw 都加 |
 | `damage_tracker.frame()` | **可能被标全脏** | 清除高亮时 |
 
-**重点 2：damage_vi_cursor 的"新旧交换"模式**
+**重点 2：damage_vi_cursor 的"新旧交换"模式（逐帧对应详解）**
 
 **函数**：[damage.rs#L76-L90](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L76-L90)
 
 ```rust
 pub fn damage_vi_cursor(&mut self, mut vi_cursor: Option<Point<usize>>) {
-    // 把新位置存到参数里，旧位置从 old_vi_cursor 拿出来
     mem::swap(&mut self.old_vi_cursor, &mut vi_cursor);
 
-    // 旧位置 → 标记 damage（光标移走了，原来的位置需要重绘）
+    if self.frame().full {
+        return;
+    }
+
+    // swap 之后 old_vi_cursor 字段里存的是什么？—— 本帧新值
     if let Some(vi_cursor) = self.old_vi_cursor {
         self.frame().damage_point(vi_cursor);
     }
 
-    // 新位置 → 标记 damage（光标到了新位置，需要重绘）
+    // swap 之后局部变量 vi_cursor 里存的是什么？—— 上帧旧值
     if let Some(vi_cursor) = vi_cursor {
         self.frame().damage_point(vi_cursor);
     }
 }
 ```
 
-**设计模式**：DamageTracker 保存**上一帧**的光标/选择位置，每帧和新位置交换，然后把新旧位置都标脏。这样光标移动时原来的位置和新位置都会被重绘。
+##### 逐帧逐行拆解：swap 前后各对应哪一帧
 
-`damage_selection` 用的是完全相同的模式（[damage.rs#L106-L135](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L106-L135)）。
+以光标从 (3,5) 移到 (8,10) 为例：
 
-**状态流转**：
+**调用前（本帧 Display::draw 阶段 B 即将进入时）**：
+```
+参数 vi_cursor = Some(Point(8,10))   ← 本帧的新光标位置（从 terminal.vi_mode_cursor 读来的）
+self.old_vi_cursor = Some(Point(3,5)) ← 上一帧调用后保存下来的"上帧位置"
+```
+
+**执行 `mem::swap(&mut self.old_vi_cursor, &mut vi_cursor)` 之后**：
+```
+self.old_vi_cursor = Some(Point(8,10))  ← 变成了本帧新值（存起来，下次调用时它就是"上帧"了）
+局部变量 vi_cursor   = Some(Point(3,5))   ← 变成了上帧旧值
+```
+
+**所以下面两个 if 判断标记 damage 时**：
+
+| 代码 | 取的变量 | 对应帧 | 含义 |
+|------|----------|--------|------|
+| `self.old_vi_cursor` | swap 后的字段值 | **本帧新位置** (8,10) | 光标现在所在的地方需要重绘 |
+| `vi_cursor`（局部） | swap 后的参数值 | **上帧旧位置** (3,5) | 光标刚才所在的地方需要重绘 |
+
+**结果**：旧位置 (3,5) + 新位置 (8,10) **两个点都被标脏**，保证光标移动时原位置和新位置都会被重绘。
+
+##### 字段的跨帧生命周期
+
+关键点：`old_vi_cursor` 和 `old_selection` 这两个字段**不参与 swap_damage 的双缓冲轮换**，它们是 DamageTracker 结构体内独立的跨帧持久化字段。swap_damage 只轮换 `frames[0]` 和 `frames[1]`。
+
+完整周期：
+```
+帧 N 的 damage_vi_cursor(Some(B)) 调用：
+  调用前 old_vi_cursor = A（来自帧 N-1 保存的）
+  swap 后：old_vi_cursor = B，局部变量 = A
+  标脏：A 和 B
+  调用结束：old_vi_cursor = B（保留到下一帧）
+
+帧 N+1 的 damage_vi_cursor(Some(C)) 调用：
+  调用前 old_vi_cursor = B（来自帧 N 保存的）
+  swap 后：old_vi_cursor = C，局部变量 = B
+  标脏：B 和 C
+  调用结束：old_vi_cursor = C（保留到下一帧）
+```
+
+---
+
+##### damage_selection：相同的交换模式 + 范围展开
+
+**函数**：[damage.rs#L106-L135](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L106-L135)
+
+```rust
+pub fn damage_selection(
+    &mut self,
+    mut selection: Option<SelectionRange>,    // 本帧新选择
+    display_offset: usize,
+) {
+    mem::swap(&mut self.old_selection, &mut selection);
+    // swap 后：
+    //   self.old_selection = 本帧新选择（保存起来下次用）
+    //   局部 selection = 上帧旧选择（用来标脏）
+
+    if self.frame().full || selection == self.old_selection {
+        return;  // 选择没变就不标
+    }
+
+    // old_selection（本帧新） + selection（上帧旧）两个范围都标脏
+    for selection in self.old_selection.into_iter().chain(selection) {
+        // ...
+        for line in start..=end {
+            self.frame().lines[line].expand(0, columns - 1);  // 整行标脏
+        }
+    }
+}
+```
+
+**与 vi_cursor 的区别**：
+1. **提前退出判断**：`selection == self.old_selection` 如果选择范围没变就跳过
+2. **标脏粒度**：不是 `damage_point` 单个点，而是每行 `expand(0, columns-1)` 整行标脏
+3. **可见性过滤**：超出视口的范围被跳过
+
+---
+
+##### 两个位置共同标记脏的设计意图
+
+| 场景 | 没有上帧旧位置 | 有上帧旧位置标记 |
+|------|---------------|----------------|
+| 光标从 A 移到 B | 只重绘 B，A 位置残留光标残影 | A 和 B 都重绘，显示正确 |
+| 选择从选区 S 变到选区 T | 只重绘 T，S 位置残留选区背景色 | S 和 T 都重绘，显示正确 |
+| 内容没变（原地不动） | 不标脏（优化） | 不标脏（优化） |
+
+**本质**：把"移动了"这个事件拆成两个部分——**擦除旧位置**和**绘制新位置**，两个位置都需要重绘才能看到正确结果。只标一个就会有残影。
+
+---
+
+**状态流转表**：
 
 | 状态 | 操作 |
 |------|------|
-| `damage_tracker.old_vi_cursor` | **与输入值交换**（本帧位置 → old，old → 被消费） |
-| `damage_tracker.old_selection` | **与输入值交换** |
-| `damage_tracker.frame()` | **更新**：累加新旧光标/选择的 damage |
+| `damage_tracker.old_vi_cursor` | **swap：** 上帧值→局部变量，本帧新值→存入字段 |
+| `damage_tracker.old_selection` | **swap：** 上帧值→局部变量，本帧新值→存入字段 |
+| `damage_tracker.frame()` | **更新**：累加旧位置+新位置的 damage（光标=点，选择=行） |
 
 ---
 
