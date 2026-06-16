@@ -747,3 +747,250 @@ if state.parser.sync_bytes_count() < processed && processed > 0 {
 | 缓冲溢出 | `buffer.len() + bytes.len() >= 2MiB` | `advance_sync` | 强制 `stop_sync_internal(None)`，当前批次走正常解析 |
 | 超时到期 | 150ms 内无新 I/O 事件 | EventLoop poll 超时 | `stop_sync()` + Wakeup |
 | 嵌套 BSU | 精确匹配 `\x1b[?2026h`（8 字节） | `advance_sync_csi` | 刷新超时、保留 BSU 后数据继续缓冲 |
+
+---
+
+## 4. DCS 旁路：hook / put / unhook 与 CSI 的完整对比
+
+DCS（Device Control String，`ESC P ... ST` 或 `ESC P ... ESC \`）是另一类转义序列，用于终端与设备之间传递任意数据。DCS 与 CSI 共享相似的参数解析阶段（Entry/Param/Intermediate），但在**旁路阶段（Passthrough）、Ignore 行为、C0 控制处理**上存在本质差异。
+
+### 4.1 DCS 生命周期概览
+
+```
+ESC P (0x50)  →  DcsEntry
+    │  (参数/中间字节/私有标记解析，与 CSI 完全同构)
+    ▼
+action_hook  →  DcsPassthrough  ← 旁路阶段：逐字节 put()
+    │  (接收 ST = ESC \ 或 CAN/SUB = 0x18/0x1A 或 8-bit ST = 0x9C)
+    ▼
+performer.unhook()  →  Ground / Escape
+```
+
+### 4.2 DCS 与 CSI 的状态 × 字节行为对比
+
+两者的 Entry/Param/Intermediate 阶段在参数和中间字节的处理上几乎一致，但在 **C0 控制**、**Ignore 实现**、**终结行为**上差异显著。
+
+#### C0 控制处理对比
+
+C0 控制指 `0x00–0x17 | 0x19 | 0x1C–0x1F`（NUL、BEL、BS、HT、LF、CR、ESC 除外的 C0 控制字符）。
+
+| 状态 | CSI 行为 | DCS 行为 |
+|------|---------|---------|
+| CsiEntry / DcsEntry | `performer.execute(byte)` ✅ | **`()`**（静默丢弃）❌ |
+| CsiParam / DcsParam | `performer.execute(byte)` ✅ | **`()`**（静默丢弃）❌ |
+| CsiIntermediate / DcsIntermediate | `performer.execute(byte)` ✅ | **`()`**（静默丢弃）❌ |
+| CsiIgnore | `performer.execute(byte)` ✅ | **交给 anywhere()**（仅 CAN/SUB/ESC 生效） |
+| CsiPassthrough（不存在） | — | — |
+| DcsPassthrough | — | `performer.put(byte)`（**字节被当作数据传递**） |
+
+**关键**：CSI 在所有非 Ignore 状态下都执行 C0 控制，但 DCS 在 Entry/Param/Intermediate 阶段**完全静默丢弃 C0 控制**。进入 `DcsPassthrough` 后，C0 控制**不 execute 而是 put**——作为数据字节的一部分传给 `handler.put(byte)`。
+
+DCS Passthrough 中的 C0 控制处理：
+
+```rust
+// vte/src/lib.rs
+fn advance_dcs_passthrough<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    match byte {
+        0x00..=0x17 | 0x19 | 0x1C..=0x7E => performer.put(byte),  // ← C0 控制被 put，不是 execute
+        0x18 | 0x1A => {                    // CAN (0x18) / SUB (0x1A)
+            performer.unhook();             // 先终止 DCS
+            performer.execute(byte);        // 再执行 CAN/SUB
+            self.state = State::Ground;
+        },
+        0x1B => {                           // ESC
+            performer.unhook();             // 先终止 DCS
+            self.reset_params();
+            self.state = State::Escape;     // 进入 Escape（准备接收 ST 或下一个序列）
+        },
+        0x7F => (),                         // DEL 丢弃
+        0x9C => {                           // 8-bit ST (String Terminator)
+            performer.unhook();
+            self.state = State::Ground;
+        },
+        _ => (),
+    }
+}
+```
+
+#### Ignore 状态处理对比
+
+**CsiIgnore** 有独立的 advance 方法，行为精细：
+
+```rust
+// vte/src/lib.rs
+fn advance_csi_ignore<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    match byte {
+        0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte), // C0 控制仍执行
+        0x20..=0x3F => (),       // 参数/中间字节静默丢弃
+        0x40..=0x7E => self.state = State::Ground, // 终结字节：回 Ground，不 dispatch
+        0x7F => (),
+        _ => self.anywhere(performer, byte),
+    }
+}
+```
+
+**DcsIgnore** 没有独立的 advance 方法，在 `change_state` 中直接交给 `anywhere()`：
+
+```rust
+// vte/src/lib.rs:168
+fn change_state<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    match self.state {
+        // ...
+        State::DcsIgnore => self.anywhere(performer, byte),  // ← 直接 anywhere！
+        // ...
+    }
+}
+
+fn anywhere<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    match byte {
+        0x18 | 0x1A => {            // CAN / SUB
+            performer.execute(byte);
+            self.state = State::Ground;
+        },
+        0x1B => {                   // ESC
+            self.reset_params();
+            self.state = State::Escape;
+        },
+        _ => (),                    // 所有其他字节静默丢弃
+    }
+}
+```
+
+**Ignore 差异总结**：
+
+| 方面 | CsiIgnore | DcsIgnore |
+|------|-----------|-----------|
+| 处理方式 | 独立 `advance_csi_ignore` 方法 | `change_state` 中直接调 `anywhere()` |
+| C0 控制 | `0x00-0x1F` 全部 execute | 仅 CAN (0x18)/SUB (0x1A) execute，其余丢弃 |
+| `0x20-0x3F` | 静默丢弃 | 静默丢弃（anywhere 默认分支） |
+| `0x40-0x7E`（终结字节） | 回 Ground | **不回 Ground！** anywhere 对这些字节返回 `()` |
+| ESC | anywhere 分支 → Escape | anywhere 分支 → Escape |
+| DEL (0x7F) | 丢弃 | anywhere 对 0x7F 返回 `()` → 丢弃 |
+| 8-bit ST (0x9C) | 丢弃 | anywhere 对 0x9C 返回 `()` → 丢弃 |
+
+**关键发现**：DcsIgnore 下收到 `0x40-0x7E`（终结字节）**不会**回到 Ground——DCS 的 Ignore 状态没有"终结字节跳出"机制，只有 CAN/SUB（回 Ground）或 ESC（回 Escape）能跳出。这是因为 DCS 的正确终结是 ST（`ESC \`），而不是单个终结字符。
+
+### 4.3 hook / put / unhook 回调详解
+
+DCS 旁路阶段有三个 Perform trait 回调：
+
+```rust
+// vte/src/lib.rs - Perform trait
+fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+fn put(&mut self, _byte: u8) {}
+fn unhook(&mut self) {}
+```
+
+Performer 中的实现（`vte/src/ansi.rs`）全部是 **unhandled debug 日志**：
+
+```rust
+// vte/src/ansi.rs:1311
+fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+    debug!(
+        "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
+        params, intermediates, ignore, action
+    );
+}
+
+fn put(&mut self, byte: u8) {
+    debug!("[unhandled put] byte={:?}", byte);
+}
+
+fn unhook(&mut self) {
+    debug!("[unhandled unhook]");
+}
+```
+
+Alacritty 的 Term **没有实现 DCS 处理**——所有 DCS 序列在 Performer 层面就被丢弃。
+
+#### hook（DCS 起始）
+
+`action_hook` 触发时机：DcsEntry / DcsParam / DcsIntermediate 中收到终结字节 `0x40-0x7E`。
+
+```rust
+// vte/src/lib.rs:465
+fn action_hook<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    if self.params.is_full() {
+        self.ignoring = true;
+    } else {
+        self.params.push(self.param);
+    }
+    performer.hook(self.params(), self.intermediates(), self.ignoring, byte as char);
+    self.state = State::DcsPassthrough;  // ← hook 之后自动进入旁路
+}
+```
+
+hook 之后状态机转入 `DcsPassthrough`，后续字节开始逐字节 `put`。
+
+#### put（DCS 旁路数据）
+
+`advance_dcs_passthrough` 中，`0x00-0x17 | 0x19 | 0x1C-0x7E` 全部走 `performer.put(byte)`。这包括：
+- 可打印字符 `0x20-0x7E`
+- C0 控制字符 `0x00-0x17 | 0x19 | 0x1C-0x1F`（**不是 execute，是 put**）
+
+#### unhook（DCS 终结）
+
+三个终结路径：
+
+| 终结方式 | 字节 | 行为 |
+|---------|------|------|
+| CAN/SUB | `0x18` / `0x1A` | `unhook()` → `execute(byte)` → Ground |
+| ESC → ST | `0x1B` → `0x5C` | DCS Passthrough 中 `0x1B` → `unhook()` → reset_params → Escape 状态；然后 Escape 状态中 `0x5C` (`\`) 触发 `esc_dispatch`（空操作 ST）→ Ground |
+| 8-bit ST | `0x9C` | `unhook()` → Ground |
+
+### 4.4 DCS 完整实例追踪
+
+合法序列：`ESC P 0;1|data\x1b\`
+
+```
+Ground:
+  0x1B ESC → reset_params(), state=Escape
+Escape:
+  0x50 P → reset_params(), state=DcsEntry
+DcsEntry:
+  0x30 '0' → action_paramnext, param=0, state=DcsParam
+DcsParam:
+  0x3B ';' → action_param, params=[0], state=DcsParam
+  0x31 '1' → action_paramnext, param=1
+  0x7C '|' → action_hook(params=[0,1], intermediates=[], ignore=false, action='|')
+            → state=DcsPassthrough
+DcsPassthrough:
+  0x64 'd' → performer.put(0x64)
+  0x61 'a' → performer.put(0x61)
+  0x74 't' → performer.put(0x74)
+  0x61 'a' → performer.put(0x61)
+  0x1B ESC → performer.unhook(), reset_params(), state=Escape
+Escape:
+  0x5C '\' → performer.esc_dispatch([], false, 0x5C)  // ST 空操作
+            → state=Ground
+```
+
+非法序列：`ESC P 0?1|...`（私有标记出现在参数之后）
+
+```
+Escape → DcsEntry → DcsParam:
+  0x30 '0' → action_paramnext
+  0x3F '?' → state=DcsIgnore  ← 参数后的私有标记非法！
+DcsIgnore (走 anywhere):
+  0x31 '1' → anywhere → _ => ()  ← 静默丢弃
+  0x7C '|' → anywhere → _ => ()  ← 静默丢弃（**不会回 Ground！**）
+  0x64 'd' → anywhere → _ => ()  ← 继续丢弃
+  0x1B ESC → anywhere → reset_params(), state=Escape  ← 只有 ESC 能跳出 DcsIgnore
+```
+
+### 4.5 完整差异对比表
+
+| 维度 | CSI | DCS |
+|------|-----|-----|
+| 入口 | ESC `[` (0x5B) | ESC `P` (0x50) |
+| 参数/中间字节/私有标记解析 | 与 DCS 完全同构 | 与 CSI 完全同构 |
+| Entry/Param/Intermediate 的 C0 控制 | `performer.execute(byte)` | **静默丢弃** |
+| 旁路阶段 | 不存在（dispatch 即终结） | `DcsPassthrough` 状态，逐字节 `put()` |
+| Passthrough 的 C0 控制 | — | **`put(byte)`**（不 execute） |
+| Passthrough 的可打印字符 | — | `put(byte)` |
+| Ignore 实现 | 独立 `advance_csi_ignore`，精细处理 | 直接走 `anywhere()`，仅 CAN/SUB/ESC 有意义 |
+| Ignore 中终结字节 `0x40-0x7E` | 回 Ground | **不回 Ground**，静默丢弃 |
+| Ignore 中 C0 控制 | 全部 execute | 仅 CAN/SUB execute |
+| 终结方式 | 单个终结字节 `0x40-0x7E` → `csi_dispatch` → Ground | ST（ESC `\`）/ CAN / SUB / 0x9C → `unhook` → Ground |
+| 终结回调 | `csi_dispatch`（一次性，带参数） | `hook` + 多次 `put` + `unhook`（流式） |
+| Term 实现 | 全量 Handler trait，30+ 方法 | 全部未实现，Performer 层 debug 日志丢弃 |
