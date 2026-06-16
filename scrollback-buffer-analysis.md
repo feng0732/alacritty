@@ -1,6 +1,6 @@
 # Alacritty 滚动缓冲用户滚动入口完整分析（修正版）
 
-> **修正要点**：本文档特别澄清了此前的事实偏差——`ViModeCursor::scroll()` 不滚动视口（只计算光标位置），`vi_motion` 的自动滚动发生在 `ViModeCursor::motion()` 的末尾调用 `scroll_to_point`，搜索流程的滚动恢复仅在 Vi 模式下生效等。
+> **修正要点**：本文档特别澄清了此前的事实偏差——`ViModeCursor::scroll()` 不滚动视口（只计算光标位置），`vi_motion` 的自动滚动发生在 `ViModeCursor::motion()` 的末尾调用 `scroll_to_point`，搜索流程的滚动恢复仅在 Vi 模式下生效。新增 5.10 节详细对照三类搜索动作（顶层/ViAction/SearchAction）的滚动行为，特别是行内搜索（f/F/t/T）的两步流程（启动不滚动、输入字符后跳转）与语义搜索（*/#）的多次跳转特性。
 
 ---
 
@@ -863,6 +863,267 @@ fn start_seeded_search(&mut self, direction: Direction, text: String) {
 | `confirm_search()` — 非 Vi 模式 | ❌ **否** | 等价于 cancel_search → 创建选区 |
 | `start_seeded_search()` Vi 模式 | ✅ 可能多次 | update_search 多次跳转 + 最终 vi_goto_point |
 
+### 5.10 Vi 搜索快捷动作与行内搜索滚动入口（新增对照）
+
+Alacritty 提供了三类搜索相关的 Action 枚举，分布在三个层级：
+
+1. **顶层 `Action`**：`SearchForward` / `SearchBackward`（/ ? 键）
+2. **`ViAction`**：包含搜索跳转、行内搜索、语义搜索等 12 个动作
+3. **`SearchAction`**：搜索模式内的操作，聚焦下一条/上一条、确认取消等
+
+以下是所有搜索相关动作的滚动行为对照：
+
+#### 5.10.1 顶层搜索启动动作
+
+| 动作 | 默认绑定 | 是否滚动视口 | 代码行为 |
+|------|---------|-------------|---------|
+| `Action::SearchForward` | `/`（Vi 模式） | ⚠️ 启动时不滚动；输入时可能滚动 | 调用 `ctx.start_search(Direction::Right)` → 只设置 origin，不滚动。后续输入字符触发 `update_search()` → `goto_match()` 才可能滚动。 |
+| `Action::SearchBackward` | `?`（Vi 模式） | ⚠️ 同上 | 调用 `ctx.start_search(Direction::Left)` → 同上。 |
+
+**`start_search()` 实现**（`event.rs:946`）：
+
+```rust
+fn start_search(&mut self, direction: Direction) {
+    // ... 初始化历史、方向 ...
+    // ✅ 只保存 origin 点，不做任何滚动
+    if self.terminal.mode().contains(TermMode::VI) {
+        self.search_state.origin = self.terminal.vi_mode_cursor.point;
+        self.search_state.display_offset_delta = 0;
+    } else {
+        let viewport_top = Line(-(self.terminal.grid().display_offset() as i32)) - 1;
+        self.search_state.origin = match direction {
+            Direction::Right => Point::new(viewport_top, Column(0)),
+            Direction::Left => Point::new(viewport_bottom, last_column),
+        };
+    }
+    // ❌ 无任何 scroll 调用
+}
+```
+
+#### 5.10.2 ViAction 搜索跳转动作（搜索后跳转）
+
+这些动作是在已有搜索结果的情况下，在匹配之间跳转：
+
+| 动作 | 默认绑定 | 是否滚动视口 | 代码行为 |
+|------|---------|-------------|---------|
+| `ViAction::SearchNext` | `n`（Vi 模式） | ✅ **是** | 调用 `search_next(origin, direction, Side::Left)` → 找到匹配后 `vi_goto_point(*regex_match.start())` → `scroll_to_point`。 |
+| `ViAction::SearchPrevious` | `N`（Vi 模式） | ✅ **是** | 同上，方向相反。 |
+| `ViAction::SearchStart` | （无默认） | ✅ **是** | 从当前位置向左找，调用 `vi_goto_point(*regex_match.start())`。 |
+| `ViAction::SearchEnd` | （无默认） | ✅ **是** | 从当前位置向右找，调用 `vi_goto_point(*regex_match.end())`。 |
+
+**`SearchNext` 实现**（`input/mod.rs:212`）：
+
+```rust
+Action::Vi(ViAction::SearchNext) => {
+    ctx.on_typing_start();
+    let terminal = ctx.terminal();
+    let direction = ctx.search_direction();
+    let vi_point = terminal.vi_mode_cursor.point;
+    let origin = match direction { /* 从光标后一格开始 */ };
+
+    if let Some(regex_match) = ctx.search_next(origin, direction, Side::Left) {
+        // ✅ vi_goto_point 先滚动再设光标
+        ctx.terminal_mut().vi_goto_point(*regex_match.start());
+        ctx.mark_dirty();
+    }
+},
+```
+
+#### 5.10.3 ViAction 行内搜索动作（f/F/t/T 系列）
+
+这些是 Vi 模式的"行内字符搜索"，在当前行（支持跨 wrap）搜索单个字符：
+
+| 动作 | 默认绑定 | 是否滚动视口 | 代码行为 |
+|------|---------|-------------|---------|
+| `ViAction::InlineSearchForward` | `f`（Vi 模式） | ⚠️ 两步：①启动时不滚动；②输入字符后可能滚动 | 第 1 步：调用 `start_inline_search(Direction::Right, false)` → 只设置 `InlineSearchState`，等待输入字符。第 2 步：字符输入触发 `inline_search_input` → `inline_search_next` → `inline_search` → 找到匹配后 `vi_goto_point(point)` → `scroll_to_point`。 |
+| `ViAction::InlineSearchBackward` | `F`（Vi 模式） | ⚠️ 同上 | `start_inline_search(Direction::Left, false)` |
+| `ViAction::InlineSearchForwardShort` | `t`（Vi 模式） | ⚠️ 同上 | `start_inline_search(Direction::Right, true)` → 找到匹配后 `stop_short`=true，光标停在匹配前一格。 |
+| `ViAction::InlineSearchBackwardShort` | `T`（Vi 模式） | ⚠️ 同上 | `start_inline_search(Direction::Left, true)` |
+| `ViAction::InlineSearchNext` | `;`（Vi 模式） | ✅ **是** | `inline_search_next()` → 调用 `inline_search(direction)` → `vi_goto_point`。 |
+| `ViAction::InlineSearchPrevious` | `,`（Vi 模式） | ✅ **是** | `inline_search_previous()` → 反向搜索。 |
+
+**启动时仅设置状态（不滚动）**（`event.rs:1445`）：
+
+```rust
+fn start_inline_search(&mut self, direction: Direction, stop_short: bool) {
+    // ✅ 只设置 InlineSearchState，char_pending = true 等待字符
+    self.inline_search_state.stop_short = stop_short;
+    self.inline_search_state.direction = direction;
+    self.inline_search_state.char_pending = true;
+    self.inline_search_state.character = None;
+    // ❌ 无滚动
+}
+```
+
+**字符输入后跳转（可能滚动）**（`event.rs:1465`）：
+
+```rust
+fn inline_search_input(&mut self, text: &str) {
+    let c = match text.chars().next() { Some(c) => c, None => return };
+    self.inline_search_state.char_pending = false;
+    self.inline_search_state.character = Some(c);
+    // ✅ 立即跳转，内部调用 vi_goto_point
+    self.inline_search_next();
+}
+```
+
+**`inline_search` 核心实现**（`event.rs:1674`）：
+
+```rust
+fn inline_search(&mut self, direction: Direction) {
+    let c = match self.inline_search_state.character { Some(c) => c, None => return };
+
+    // 在当前行（支持 wrap 跨行）搜索字符
+    let vi_point = self.terminal.vi_mode_cursor.point;
+    let point = match direction {
+        Direction::Right => self.terminal.inline_search_right(vi_point, search_character),
+        Direction::Left => self.terminal.inline_search_left(vi_point, search_character),
+    };
+
+    if let Ok(mut point) = point {
+        // t/T 模式：停在匹配前一格
+        if self.inline_search_state.stop_short {
+            point = match direction { /* prev/next 单元格 */ };
+        }
+
+        // ✅ vi_goto_point → scroll_to_point → 可能滚动视口
+        self.terminal.vi_goto_point(point);
+        self.mark_dirty();
+    }
+}
+```
+
+**关键点**：行内搜索虽然叫"行内"，但支持跨 wrap 行。如果用户正在查看历史，目标行不在视口内，`vi_goto_point` → `scroll_to_point` 会把视口滚回目标行。
+
+#### 5.10.4 ViAction 语义搜索动作（* / #）
+
+搜索光标下的语义化词（或选中的文本）：
+
+| 动作 | 默认绑定 | 是否滚动视口 | 代码行为 |
+|------|---------|-------------|---------|
+| `ViAction::SemanticSearchForward` | `*`（Vi 模式） | ✅ **是** | 调用 `semantic_word` 获取光标下的词 → `ctx.start_seeded_search(Direction::Right, seed_text)` → 逐字符输入搜索词（触发多次 `update_search` → `goto_match`）→ 退出搜索 → Vi 模式下额外 `vi_goto_point` 精确定位。 |
+| `ViAction::SemanticSearchBackward` | `#`（Vi 模式） | ✅ **是** | 同上，方向 `Direction::Left`。 |
+
+**实现**（`input/mod.rs:285`）：
+
+```rust
+Action::Vi(ViAction::SemanticSearchForward | ViAction::SemanticSearchBackward) => {
+    // 获取搜索种子：选中词优先，否则光标下的语义词
+    let seed_text = match ctx.terminal().selection_to_string() {
+        Some(selection) if !selection.is_empty() => selection,
+        _ => ctx.semantic_word(ctx.terminal().vi_mode_cursor.point),
+    };
+
+    if !seed_text.is_empty() {
+        let direction = match self { /* Right / Left */ };
+        // ✅ start_seeded_search 会触发多次滚动
+        ctx.start_seeded_search(direction, seed_text);
+    }
+},
+```
+
+**`start_seeded_search` 完整流程**（`event.rs:984`）：
+
+```rust
+fn start_seeded_search(&mut self, direction: Direction, text: String) {
+    // 1. 先 start_search（不滚动）
+    self.start_search(direction);
+
+    // 2. 逐字符输入搜索词 → 每次触发 update_search → goto_match → 可能滚动
+    for c in text.chars() {
+        if let '$' | '('..='+' | '?' | '['..='^' | '{'..='}' = c {
+            self.search_input('\\');  // 转义正则特殊字符
+        }
+        self.search_input(c);  // ← 每次输入都触发 update_search + goto_match
+    }
+
+    // 3. confirm_search 退出搜索
+    self.confirm_search();
+
+    // 4. Vi 模式：额外做一次更精准的跳转
+    if !self.terminal.mode().contains(TermMode::VI) { return; }
+    let target = self.search_next(origin, ...).and_then(|rm| { /* 更精确定位 */ });
+    if let Some(target) = target {
+        // ✅ 再次调用 vi_goto_point
+        self.terminal_mut().vi_goto_point(target);
+        self.mark_dirty();
+    }
+}
+```
+
+#### 5.10.5 SearchAction 搜索模式内操作
+
+这些是在搜索输入框激活时（`BindingMode::SEARCH`）的操作：
+
+| 动作 | 默认绑定 | 是否滚动视口 | 代码行为 |
+|------|---------|-------------|---------|
+| `SearchAction::SearchFocusNext` | `Enter`（搜索模式，非 Vi） | ✅ **是** | `ctx.advance_search_origin(ctx.search_direction())` → 先 `scroll_to_point(new_origin)` 对齐，再 `goto_match(None)` 无限制查找。 |
+| `SearchAction::SearchFocusPrevious` | `Shift-Enter`（搜索模式，非 Vi） | ✅ **是** | 同上，方向相反。 |
+| `SearchAction::SearchConfirm` | `Enter`（搜索模式，Vi） | ⚠️ 仅无结果时可能 | Vi 模式：取消延迟搜索 → `goto_match(None)` 无结果则 `search_reset_state`（恢复视口）；非 Vi 模式：直接 `cancel_search()` → 创建选区，不滚动。 |
+| `SearchAction::SearchCancel` | `Esc`（搜索模式） | ⚠️ 仅 Vi 模式 | Vi 模式：`search_reset_state` 恢复视口和光标；非 Vi 模式：创建选区，停留在匹配处，不滚动。 |
+| `SearchAction::SearchClear` | （无默认） | ⚠️ 取决于后续 | 调用 `cancel_search()` → `start_search(direction)`。是否滚动取决于取消时的操作。 |
+| `SearchAction::SearchDeleteWord` | `Ctrl-W`（搜索模式） | ⚠️ 取决于匹配 | 只删除搜索词的最后一个词 → 调用 `update_search()` → `goto_match()`，找到匹配则滚动。 |
+| `SearchAction::SearchHistoryPrevious` | `Up`（搜索模式） | ⚠️ 取决于匹配 | 切换到上一个历史搜索词 → `update_search()` → `goto_match()`。 |
+| `SearchAction::SearchHistoryNext` | `Down`（搜索模式） | ⚠️ 取决于匹配 | 切换到下一个历史搜索词 → 同上。 |
+
+**`advance_search_origin` 实现**（`event.rs:1132`）：
+
+```rust
+fn advance_search_origin(&mut self, direction: Direction) {
+    if let Some(focused_match) = &self.search_state.focused_match {
+        let new_origin = match direction { /* 从当前匹配后开始 */ };
+        // ✅ 先对齐到当前匹配（如果不在视口内，先滚回来）
+        self.terminal.scroll_to_point(new_origin);
+        self.search_state.display_offset_delta = 0;
+        self.search_state.origin = new_origin;
+    }
+    // ✅ 再跳到下一条（无限制查找，可能滚动很远）
+    let search_direction = mem::replace(&mut self.search_state.direction, direction);
+    self.goto_match(None);
+    self.search_state.direction = search_direction;
+}
+```
+
+#### 5.10.6 行内搜索与普通搜索的滚动入口对比
+
+| 维度 | 行内搜索（f/F/t/T） | 普通搜索（/ ?） | 语义搜索（* #） |
+|------|---------------------|-----------------|----------------|
+| 目标 | 单个字符 | 任意正则 | 光标下的语义词 |
+| 范围 | 当前行（支持跨 wrap） | 整个缓冲区（含 scrollback） | 整个缓冲区（含 scrollback） |
+| 启动动作 | `start_inline_search` → 只设状态 | `start_search` → 只设 origin | `start_seeded_search` → 触发多次跳转 |
+| 字符输入 | 仅等待 1 个字符，输入后立即跳转 | 等待任意长度字符串，每输入一个字符跳转一次 | 自动填入种子词，无需用户输入 |
+| 跳转方法 | `inline_search_right/left` → `vi_goto_point` | `goto_match(limit)` → `vi_goto_point` / `scroll_to_point` | 多次 `goto_match` + 最终 `vi_goto_point` |
+| 退出方式 | 输入字符后自动结束（或按 Esc） | Enter 确认 / Esc 取消 | 自动填入后自动 confirm 退出 |
+
+#### 5.10.7 所有搜索相关动作滚动行为汇总表
+
+| 层级 | 动作 | 是否触发视口滚动 | 滚动触发点 |
+|------|------|-----------------|-----------|
+| **顶层 Action** | `SearchForward` | ⚠️ 启动不滚；输入时可能滚 | `update_search` → `goto_match` |
+| | `SearchBackward` | ⚠️ 同上 | 同上 |
+| **ViAction** | `SearchNext` | ✅ **是** | `vi_goto_point` → `scroll_to_point` |
+| | `SearchPrevious` | ✅ **是** | 同上 |
+| | `SearchStart` | ✅ **是** | 同上 |
+| | `SearchEnd` | ✅ **是** | 同上 |
+| | `InlineSearchForward` | ⚠️ 启动不滚；输入后可能滚 | `inline_search` → `vi_goto_point` |
+| | `InlineSearchBackward` | ⚠️ 同上 | 同上 |
+| | `InlineSearchForwardShort` | ⚠️ 同上 | 同上 |
+| | `InlineSearchBackwardShort` | ⚠️ 同上 | 同上 |
+| | `InlineSearchNext` | ✅ **是** | 同上 |
+| | `InlineSearchPrevious` | ✅ **是** | 同上 |
+| | `SemanticSearchForward` | ✅ **是** | `start_seeded_search` → 多次 `goto_match` |
+| | `SemanticSearchBackward` | ✅ **是** | 同上 |
+| **SearchAction** | `SearchFocusNext` | ✅ **是** | `scroll_to_point` + `goto_match(None)` |
+| | `SearchFocusPrevious` | ✅ **是** | 同上 |
+| | `SearchConfirm` (Vi) | ⚠️ 仅无结果时 | `goto_match(None)` 无结果 → `search_reset_state` |
+| | `SearchConfirm` (非 Vi) | ❌ **否** | `cancel_search` → 创建选区，不滚动 |
+| | `SearchCancel` (Vi) | ✅ **是** | `search_reset_state` → 恢复视口 |
+| | `SearchCancel` (非 Vi) | ❌ **否** | 创建选区，不滚动 |
+| | `SearchClear` | ⚠️ 取决于取消 | `cancel_search` → `start_search` |
+| | `SearchDeleteWord` | ⚠️ 取决于匹配 | `update_search` → `goto_match` |
+| | `SearchHistoryPrevious` | ⚠️ 取决于匹配 | `update_search` → `goto_match` |
+| | `SearchHistoryNext` | ⚠️ 取决于匹配 | `update_search` → `goto_match` |
+
 ---
 
 ## 六、触摸滚动完整调用链
@@ -1209,3 +1470,15 @@ if delta_y.abs() > MAX_TAP_DISTANCE {
 | start_seeded_search | `alacritty/src/event.rs` | 984-1027 |
 | 窗口上下文搜索微调 | `alacritty/src/window_context.rs` | 554-559 |
 | Scrolling 配置 | `alacritty/src/config/scrolling.rs` | 1-53 |
+| **ViAction 枚举定义**（搜索相关） | `alacritty/src/config/bindings.rs` | 298-335 |
+| **SearchAction 枚举定义** | `alacritty/src/config/bindings.rs` | 340-357 |
+| **InlineSearchState 结构体** | `alacritty/src/event.rs` | 643-661 |
+| **Action::execute 搜索相关实现**（SearchNext/Previous/Start/End） | `alacritty/src/input/mod.rs` | 212-261 |
+| **行内搜索启动**（start_inline_search） | `alacritty/src/event.rs` | 1445-1450 |
+| **行内搜索字符输入**（inline_search_input） | `alacritty/src/event.rs` | 1465-1478 |
+| **行内搜索跳转**（inline_search_next/previous） | `alacritty/src/event.rs` | 1453-1462 |
+| **行内搜索核心实现**（inline_search） | `alacritty/src/event.rs` | 1674-1706 |
+| **终端层 inline_search_right/left** | `alacritty_terminal/src/term/search.rs` | 565-590 |
+| **语义搜索**（Action::execute 中） | `alacritty/src/input/mod.rs` | 285-299 |
+| **SearchAction 实现**（SearchFocus* 等） | `alacritty/src/input/mod.rs` | 303-319 |
+| **ViAction 行内搜索入口** | `alacritty/src/input/mod.rs` | 271-284 |
