@@ -37,20 +37,41 @@ if config.live_config_reload() {
 ### 3.1 路径预处理（四步）
 
 ```
-输入: paths = config.config_paths（原始路径列表）
+输入: paths = config.config_paths（来自 parse_config 的原始路径列表）
   │
   ├─ 1. paths.is_empty()? → 是则返回 None，不创建监听
   │
   ├─ 2. watched_hash = hash_paths(&paths)   ← 对原始路径计算哈希，保存到结构体
   │
   ├─ 3. paths.retain(|p| p.metadata().is_file())  ← 排除字符设备/socket
+  │      注：metadata() 会跟随符号链接，软链指向的真实文件是普通文件则保留
   │
-  └─ 4. 逐个 canonicalize：
-         ├─ 若是符号链接 → 将 canonicalize 后的真实路径追加到 paths 末尾
-         └─ 否则 → 原地替换为 canonicalize 后的路径
+  └─ 4. 逐个 canonicalize（代码位于 alacritty/src/config/monitor.rs:49-57）：
+         for i in 0..paths.len() {
+             if let Ok(canonical_path) = paths[i].canonicalize() {
+                 match paths[i].symlink_metadata() {
+                     Ok(m) if m.is_symlink() => paths.push(canonical_path),
+                     _                       => paths[i] = canonical_path,
+                 }
+             }
+         }
+         ├─ 若 paths[i] 是符号链接 → 保留原软链路径不变，将真实路径追加到 paths 末尾
+         └─ 若 paths[i] 是普通文件 → 原地替换为 canonicalize 后的真实路径
 ```
 
 **关键点**：`watched_hash` 在步骤 2 计算，基于的是**尚未被过滤和规范化的原始 paths**。后续步骤 3、4 会修改 `paths`，但不影响已保存的 `watched_hash`。
+
+#### 3.1.1 paths 在预处理前后的具体差异
+
+假设主配置 `~/.config/alacritty/alacritty.toml` 是软链，指向 `~/dotfiles/alacritty.toml`，并 import 了一个普通文件 `~/alacritty/theme.toml`：
+
+| 阶段 | paths 内容 | 说明 |
+|------|------------|------|
+| 输入（config.config_paths） | `["~/.config/alacritty/alacritty.toml", "~/alacritty/theme.toml"]` | 都是规范化绝对路径，但未 canonicalize |
+| 步骤 3（retain 后） | `["~/.config/alacritty/alacritty.toml", "~/alacritty/theme.toml"]` | 两个都是普通文件（软链跟随检查通过），均保留 |
+| 步骤 4（canonicalize 后） | `["~/.config/alacritty/alacritty.toml", "/home/xxx/alacritty/theme.toml", "/home/xxx/dotfiles/alacritty.toml"]` | 第一个是软链→保留原路径+追加真实路径；第二个是普通文件→原地替换为真实路径 |
+
+**核心差异**：符号链接的原始路径会被保留，真实路径追加在末尾；普通文件直接被真实路径替换。
 
 ### 3.2 创建 Watcher 线程
 
@@ -108,8 +129,25 @@ loop {
 **路径匹配**：超时后检查 `received_events` 中所有路径是否与 `paths`（规范化的监听列表）有交集。
 
 **事件发送**：始终发送 `Event::new(EventType::ConfigReload(paths[0].clone()), None)`。
-- `paths[0]` 是主配置文件的规范化路径
 - 无论变更的是主配置还是 import 文件，都发送主配置路径触发完整重载
+- `paths[0]` 的具体含义取决于主配置是否为符号链接：
+  - 主配置是普通文件 → `paths[0]` = canonicalize 后的真实路径
+  - 主配置是软链 → `paths[0]` = **原始软链路径**（真实路径被追加到 paths 末尾）
+
+#### 3.4.1 父目录监听范围
+
+watcher 实际监听的是 `paths` 中每个路径的**父目录**（去重后），而非文件本身。对于软链主配置，会同时监听：
+- 软链所在目录（如 `~/.config/alacritty/`）
+- 真实文件所在目录（如 `~/dotfiles/`）
+
+这意味着无论编辑器修改软链路径还是真实路径的文件，事件都能被捕获。
+
+#### 3.4.2 路径匹配的双通道
+
+由于软链的 `paths` 中同时包含软链路径和真实路径，notify 事件携带的路径无论等于哪一个，都能通过 `any(|path| paths.contains(&path))` 的匹配检查。这兼容了不同编辑器的保存策略：
+- 部分编辑器写入软链 → 事件路径为软链路径
+- 部分编辑器跟随软链写入真实文件 → 事件路径为真实路径
+- 部分编辑器先删后建真实文件 → 事件路径为真实路径
 
 ### 3.5 关机机制
 
@@ -178,6 +216,10 @@ parse_config(path, config_paths, recursion_limit)
 ```
 
 **`config_paths` 的构成**：按 DFS 前序遍历收集所有被加载的文件路径。主配置文件排在第一个。
+
+`config_paths` 中每条路径的形态：
+- 主配置路径：即传入 `config::reload()` 的参数。如果主配置是软链，此处记录的是**软链路径**（因为 `parse_config` 直接 `push(path.to_owned())`，不做 canonicalize）。
+- Import 路径：先经 `normalize_import`（alacritty/src/config/mod.rs:318-333）处理，展开 `~/`、相对路径补全为绝对路径，但**不调用 canonicalize**。因此如果 import 本身指向软链，此处记录的仍是软链路径。
 
 每次 reload 都**完整重走**这条链路，产生全新的 `config_paths` 列表。
 
@@ -272,7 +314,105 @@ fn hash_paths(files: &[PathBuf]) -> Option<u64> {
 
 ---
 
-## 六、三种变更场景的完整时序
+## 六、路径处理细节详解：软链主配置、真实路径、导入文件监听
+
+### 6.1 路径流经的关键节点
+
+```
+config.config_paths (parse_config 收集的原始路径)
+        │
+        │ 传入 ConfigMonitor::new()
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│  ConfigMonitor::new() 路径预处理                        │
+│  1. hash_paths(原始 paths) → watched_hash（供重启判断） │
+│  2. retain：过滤非文件                                   │
+│  3. canonicalize 循环：                                  │
+│     ├─ 软链 → 保留原路径，追加真实路径                   │
+│     └─ 普通文件 → 替换为真实路径                         │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+                           ▼
+            paths（传入 watcher 线程的最终列表）
+                           │
+             ┌─────────────┴──────────────┐
+             ▼                            ▼
+   父目录去重后交给 notify 监听    路径匹配时用 paths.contains()
+             │                            │
+             ▼                            ▼
+        操作系统事件             any(|p| paths.contains(p))
+                                          │
+                                          ▼
+                               发送 ConfigReload(paths[0])
+                                          │
+                                          ▼
+                           主线程 config::reload(paths[0])
+                                          │
+                                          ▼
+                           parse_config(paths[0]) → 新的 config_paths
+```
+
+### 6.2 主配置为软链时 paths[0] 的完整流转
+
+设主配置 `~/.config/alacritty/alacritty.toml` 是符号链接，指向真实文件 `~/dotfiles/alacritty.toml`。
+
+| 阶段 | paths[0] 的值 | 说明 |
+|------|---------------|------|
+| 1. 启动时 config_paths[0] | `~/.config/alacritty/alacritty.toml` | parse_config 直接 push 传入路径 |
+| 2. ConfigMonitor::new() 输入 | `~/.config/alacritty/alacritty.toml` | 与上相同 |
+| 3. watched_hash 计算 | 基于 `~/.config/alacritty/alacritty.toml` | 步骤 2 完成，未修改 |
+| 4. canonicalize 循环后 | `~/.config/alacritty/alacritty.toml`（**不变**） | 检测到是软链，保留原路径，真实路径被 push 到 paths 末尾 |
+| 5. watcher 线程内 paths[0] | `~/.config/alacritty/alacritty.toml` | 软链路径 |
+| 6. 触发重载时发送的路径 | `~/.config/alacritty/alacritty.toml` | `EventType::ConfigReload(paths[0].clone())` |
+| 7. 主线程 reload 接收的路径 | `~/.config/alacritty/alacritty.toml` | 软链路径 |
+| 8. reload 后新的 config_paths[0] | `~/.config/alacritty/alacritty.toml` | parse_config 直接 push 软链路径 |
+| 9. needs_restart 比较 | 新 config_paths hash == watched_hash | 相等 → 返回 true → 重启 Monitor |
+
+**结论**：主配置为软链时，重载路径全程是软链路径，与真实路径无关。reload 时 `fs::read_to_string(软链路径)` 会自动跟随符号链接读取真实文件，因此结果正确。
+
+### 6.3 真实路径监听的作用范围
+
+真实路径（canonicalize 后）被加入 `paths` 列表后，有两个作用：
+
+1. **路径匹配**：notify 事件中的路径如果是真实路径（例如编辑器直接写入真实文件），也能通过 `paths.contains()` 检查。
+2. **父目录监听**：真实路径的父目录会被加入 watcher 的监听列表，使得直接修改真实文件所在目录的事件也能被捕获。
+
+真实路径**不参与**：
+- `watched_hash` 计算（hash 在 canonicalize 之前就完成了）
+- 重载事件发送（始终使用 paths[0]）
+- `config_paths` 记录（parse_config 不做 canonicalize）
+
+### 6.4 导入文件的监听与主配置软链的关系
+
+导入文件的路径在 `load_imports` → `normalize_import` 中处理：
+
+```rust
+normalize_import(base_config_path, import_path):
+  ├─ ~/xxx → home_dir/xxx
+  ├─ 相对路径 → base_config_path.parent()/相对路径
+  └─ 返回规范化后的绝对路径（不调用 canonicalize）
+```
+
+然后 parse_config 直接将此路径 `push` 到 `config_paths`。
+
+**关键关系**：
+- import 路径与主配置是否为软链**无关**。import 的 base 是主配置文件所在目录，normalize_import 不跟随主配置的软链去找真实目录。
+- 示例：主配置 `~/.config/alacritty/alacritty.toml` 是软链（指向 `~/dotfiles/`），其中写 `import = ["theme.toml"]`。normalize_import 会解析为 `~/.config/alacritty/theme.toml`，**不会**解析为 `~/dotfiles/theme.toml`。
+- 如果 import 文件本身是软链，进入 ConfigMonitor 后会被同样处理：保留软链路径 + 追加真实路径，双重监听。
+
+### 6.5 各层路径形态汇总
+
+| 层面 | 主配置（软链） | 主配置（普通文件） | import 文件（软链） | import 文件（普通文件） |
+|------|----------------|--------------------|--------------------|------------------------|
+| config_paths | 软链路径 | 规范化绝对路径 | 软链路径 | 规范化绝对路径 |
+| watched_hash 输入 | 软链路径 | 规范化绝对路径 | 软链路径 | 规范化绝对路径 |
+| paths（watcher 内匹配用） | [软链路径, 真实路径] | [真实路径] | [软链路径, 真实路径] | [真实路径] |
+| 监听父目录 | 软链目录 + 真实目录 | 真实目录 | 软链目录 + 真实目录 | 真实目录 |
+| 重载发送路径 | 软链路径 | 真实路径 | —（用主配置 paths[0]） | — |
+
+---
+
+## 七、三种变更场景的完整时序
 
 ### 场景 A：修改主配置内容（import 列表不变）
 
@@ -333,7 +473,7 @@ fn hash_paths(files: &[PathBuf]) -> Option<u64> {
 
 ---
 
-## 七、窗口级配置应用
+## 八、窗口级配置应用
 
 代码位于 `alacritty/src/window_context.rs:261-333`。
 
@@ -365,7 +505,7 @@ fn hash_paths(files: &[PathBuf]) -> Option<u64> {
 
 ---
 
-## 八、完整数据流总览
+## 九、完整数据流总览
 
 ```
                           ┌──────────────────────────────────────────────┐
@@ -411,7 +551,7 @@ fn hash_paths(files: &[PathBuf]) -> Option<u64> {
 
 ---
 
-## 九、设计要点
+## 十、设计要点
 
 1. **目录监听策略**：watcher 监听父目录，应用层匹配文件路径，兼容原子保存
 2. **10ms 防抖**：累积窗口内所有事件，超时后一次性判断
@@ -419,5 +559,8 @@ fn hash_paths(files: &[PathBuf]) -> Option<u64> {
 4. **完整配置树重解析**：reload 从主配置开始递归处理所有 import
 5. **Rc 共享 + 写时克隆**：多窗口共享同一份配置，更新时创建新的 Rc
 6. **差异更新**：`update_config` 对比新旧配置，仅处理变更项
-7. **符号链接双重监听**：软链文件同时监听原始路径和真实路径
+7. **符号链接双重监听**：软链文件同时监听原始路径和真实路径，兼容不同编辑器保存策略
 8. **路径哈希与顺序无关**：先排序再哈希，`config_paths` 顺序变化不影响判断
+9. **软链主配置全程保留软链路径**：paths[0]、重载发送路径、config_paths 全程使用软链路径，`fs::read_to_string` 自动跟随
+10. **Import 路径不跟随主配置软链**：normalize_import 基于软链所在目录解析相对 import，不跟随到真实目录
+11. **真实路径仅用于匹配与监听**：canonicalize 后的真实路径不参与 hash、重载发送和 config_paths 记录
