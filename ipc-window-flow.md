@@ -159,20 +159,23 @@ pub fn override_config(&mut self, config: &mut UiConfig) {
 
 ### 3.2 三层配置覆盖模型
 
-Alacritty 的配置是一个**洋葱式叠加**结构，从内到外（优先级从低到高）依次是：
+Alacritty 的配置由三层结构组成，但**优先级不是固定的层级关系**。先看各层的存储位置：
 
 ```
-低优先级 ──────────────────────────────────────────────── 高优先级
-
-┌─────────────────┐  ┌────────────────────┐  ┌────────────────────┐
-│  基础配置       │  │  全局 IPC 覆盖     │  │  窗口级覆盖         │
-│  (config file)  │  │  (global_ipc_...)  │  │  (window_config)   │
-└────────┬────────┘  └─────────┬──────────┘  └─────────┬──────────┘
-         │                     │                        │
-         └─────────────────────┴────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  第 1 层：基础配置 (Rc<UiConfig>)                        │
+│  来自：配置文件 + 启动时 CLI 参数（启动时一次性解析）      │
+│  生命周期：进程级，ConfigReload 时更新                    │
+└──────────────────────────────┬──────────────────────────┘
                                │
-                               ▼
-                      最终生效的 config
+           ┌───────────────────┴─────────────────────┐
+           │                                         │
+┌──────────▼────────────────┐            ┌───────────▼──────────────────┐
+│  第 2 层：全局 IPC 覆盖    │            │  第 3 层：窗口级覆盖          │
+│  global_ipc_options        │            │  window_config（每个窗口独立）│
+│  存储：Processor           │            │  存储：WindowContext          │
+│  用途：新窗口创建模板       │            │  用途：该窗口实际生效的覆盖    │
+└────────────────────────────┘            └──────────────────────────────┘
 ```
 
 关键代码：
@@ -180,52 +183,83 @@ Alacritty 的配置是一个**洋葱式叠加**结构，从内到外（优先级
 - 窗口级覆盖存储：[window_context.rs:68](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L68) `window_config: ParsedOptions`
 - 窗口级应用入口：[window_context.rs:265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L265) `self.config = self.window_config.override_config_rc(...)`
 
-### 3.3 冲突优先级：同一项谁覆盖谁？
+### 3.3 ⚠️ 冲突优先级：同一项谁覆盖谁？
 
-这是核心问题。当多层覆盖针对**同一个配置项**时，优先级如下（高优先级覆盖低优先级）：
+**重要修正**：优先级**不是**固定的"窗口级 > 全局"层级关系。对于已有的窗口，全局 IPC Config 和窗口级 IPC Config 走的是**完全相同的代码路径**——都调用 `add_window_config()`，都追加到同一个 `window_config` 末尾。所以优先级**完全取决于发送顺序**，后发的覆盖先发的。
 
-| 优先级 | 覆盖来源 | 适用场景 |
-|--------|---------|----------|
-| 🏆 最高 | 后发的 IPC Config 消息 | 同一条路径上多次调用 config，后发的赢 |
-| 🥈 次高 | 窗口级覆盖（window_config） | 窗口专属的配置 |
-| 🥉 中 | 全局 IPC 覆盖（global_ipc_options） | 全局运行时设置 |
-| 最低 | 基础配置（配置文件 + 启动 CLI） | 底层默认值 |
+#### 底层原理：ParsedOptions 顺序决定一切
 
-下面分场景拆解：
-
-#### 场景 A：多次 IPC Config 消息作用于同一个窗口
-
-每次 `alacritty msg config` 调用 `add_window_config()`，会把新的 options **追加**到 `window_config` 末尾（[window_context.rs:359](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L359)）：
+`ParsedOptions` 内部是 `Vec<(String, Value)>`，`override_config()` 按 Vec 顺序依次调用 `config.replace()`，后出现的同名配置会覆盖先出现的（[cli.rs:381-396](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L381-L396)）。
 
 ```rust
-pub fn add_window_config(&mut self, config: Rc<UiConfig>, options: &ParsedOptions) {
-    self.window_config.extend_from_slice(options);  // 追加到末尾
-    self.update_config(config);
+// 按顺序依次应用，后出现的覆盖先出现的
+while i < self.config_options.len() {
+    match config.replace(parsed.clone()) {
+        Err(err) => self.config_options.swap_remove(i),
+        Ok(_) => i += 1,
+    }
 }
 ```
 
-→ **后发的 config 消息优先级更高**，同名字段会覆盖之前的。
+**所有优先级场景的本质**：谁后追加到 `window_config` 末尾，谁的优先级就高。
 
-#### 场景 B：全局 IPC Config vs 窗口级 IPC Config
+下面分场景逐一分析：
 
-假设有这样的操作序列：
+---
+
+#### 场景 A：先全局 config，后窗口级 config → 窗口级赢
+
+操作序列：
 ```bash
-alacritty msg config cursor.style=Beam          # 全局设置（window_id=None）
-alacritty msg config --window-id 3 cursor.style=Underline  # 只改窗口 3
+alacritty msg config cursor.style=Beam          # 全局（window_id=None）
+alacritty msg config --window-id 3 cursor.style=Underline  # 窗口级
 ```
 
-对于窗口 3 来说：
-1. 第一步全局 config → 窗口 3 的 `window_config` 追加了 `cursor.style=Beam`
-2. 第二步窗口级 config → 窗口 3 的 `window_config` 又追加了 `cursor.style=Underline`
-3. `window_config` 顺序：[Beam, Underline]
-4. 应用时后出现的 Underline 覆盖 Beam → **窗口级赢**
+**代码路径**（[event.rs:294-319](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L294-L319)）：
 
-对于窗口 1（没发过窗口级 config）：
-- 只有 Beam → 全局设置生效
+第一条消息（全局，window_id=None）：
+- `filter` 条件：`window_id.is_none() || ...` → 所有窗口都匹配
+- 每个匹配窗口：`add_window_config(config, &options)` → 追加 `Beam` 到 window_config
+- 同时：`global_ipc_options.append(&mut options)` → 存入全局模板
 
-**结论**：窗口级 IPC Config 的优先级高于全局 IPC Config（因为后追加到 window_config）。
+第二条消息（窗口级，window_id=3）：
+- `filter` 条件：`window_id == Some(3)` → 只有窗口 3 匹配
+- 窗口 3：`add_window_config(config, &options)` → 追加 `Underline` 到 window_config
+- **不**更新 `global_ipc_options`（window_id 不是 None）
 
-#### 场景 C：CreateWindow 自带 options vs 全局 IPC 覆盖
+窗口 3 的 `window_config` 最终顺序：`[Beam, Underline]`
+
+→ Underline 在后面 → **窗口级赢**
+
+---
+
+#### 场景 B：先窗口级 config，后全局 config → 全局赢（⚠️ 修正点！）
+
+操作序列：
+```bash
+alacritty msg config --window-id 3 cursor.style=Underline  # 先窗口级
+alacritty msg config cursor.style=Beam          # 后全局（window_id=None）
+```
+
+**代码路径**：
+
+第一条消息（窗口级，window_id=3）：
+- 只有窗口 3 匹配 → 追加 `Underline` 到 window_config
+- **不**更新 `global_ipc_options`
+
+第二条消息（全局，window_id=None）：
+- 所有窗口都匹配 → 窗口 3 追加 `Beam` 到 window_config
+- 同时更新 `global_ipc_options`
+
+窗口 3 的 `window_config` 最终顺序：`[Underline, Beam]`
+
+→ Beam 在后面 → **全局赢**
+
+> **之前的错误结论**："窗口级优先级高于全局"。实际上**没有固定层级**，完全取决于发送顺序。谁后发，谁追加在后面，谁就赢。
+
+---
+
+#### 场景 C：追加窗口创建时：CreateWindow -o vs global_ipc_options
 
 **仅适用于追加窗口**（初始窗口不应用任何 IPC 覆盖）。
 
@@ -239,16 +273,109 @@ config_overrides.extend_from_slice(&self.global_ipc_options);  // ② 再追加�
 
 这个设计有点反直觉（通常更具体的应该优先级更高），但代码确实是这样写的。
 
-#### 场景 D：创建窗口后再发全局 Config
+新窗口的 `window_config` 初始顺序：`[CreateWindow options..., global options...]`
 
+---
+
+#### 场景 D：创建窗口后再发 IPC Config → 后者赢
+
+操作序列：
 ```bash
 alacritty msg create-window -o cursor.style=Beam     # 窗口创建时自带 Beam
-alacritty msg config cursor.style=Underline          # 后续全局设置 Underline
+alacritty msg config --window-id 3 cursor.style=Underline  # 后续窗口级设置
 ```
 
-创建时：`window_config = [Beam, global(空)]`
-后续全局 config：`window_config` 追加 `Underline` → `[Beam, Underline]`
-→ Underline 在后面 → **后续全局 config 覆盖创建时自带的 option**
+创建时：`window_config = [Beam, ...（global）]`
+后续 config：`window_config` 追加 `Underline` → `[Beam, global..., Underline]`
+
+→ Underline 在最后 → **后发的 IPC Config 赢**
+
+不论后续这条消息是全局还是窗口级，只要后发就赢。
+
+---
+
+### 优先级总结表
+
+| 场景 | 操作顺序 | 谁赢 | 原因 |
+|------|---------|------|------|
+| 场景 A | 先全局 → 后窗口级 | 窗口级 | 窗口级后追加 |
+| 场景 B | 先窗口级 → 后全局 | 全局 | 全局后追加 |
+| 场景 C | 创建窗口：option + global | global | 创建时 global 追加在 option 后面 |
+| 场景 D | 创建后发任意 config | 后者 | 后追加在末尾 |
+| 场景 E | 连续发多条全局 config | 最后一条 | 后追加在末尾 |
+| 场景 F | 连续发多条同窗口级 config | 最后一条 | 后追加在末尾 |
+
+**唯一原则**：在 `window_config` Vec 中，位置越靠后，优先级越高。
+
+---
+
+### 3.3.1 全局 vs 窗口级：概念上的差异（不是优先级差异）
+
+虽然对于**已有窗口**，全局和窗口级没有优先级差异（只看顺序），但它们在**作用范围**和**副作用**上有本质区别：
+
+| 维度 | 全局 Config（window_id=None） | 窗口级 Config（window_id=N） |
+|------|------------------------------|-----------------------------|
+| 作用窗口 | 所有窗口 | 仅匹配的单个窗口 |
+| 更新 global_ipc_options | ✅ 更新（影响未来新窗口） | ❌ 不更新 |
+| 追加到 window_config | ✅ 所有窗口 | ✅ 仅目标窗口 |
+
+---
+
+### 3.3.2 无效覆盖项清理的真实触发条件
+
+`ParsedOptions::override_config()` 有一个"失败自动清理"机制：如果某个 option 无效（字段不存在、类型错误等），会用 `swap_remove(i)` 从列表中删除（[cli.rs:385-391](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L385-L391)）。
+
+**关键修正**：清理不是"每次发送 config 就检查"，也不是"ConfigReload 自动清理所有"。清理**只在 `override_config()` 被实际调用时发生**，而且**哪个 ParsedOptions 实例调用，就清理哪个实例的列表**。
+
+#### 触发时机总览
+
+| 触发事件 | 谁的 `override_config` 被调用 | 清理谁的无效项 | 代码行 |
+|---------|------------------------------|---------------|--------|
+| `add_window_config()` | `self.window_config` | 该窗口的 window_config | [window_context.rs:359-362](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L359-L362) |
+| `reset_window_config()` | `self.window_config`（但已被 clear） | （无，因为是空的） | [window_context.rs:347-350](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L347-L350) |
+| `ConfigReload` → `update_config()` | `self.window_config` | 该窗口的 window_config | [window_context.rs:264-265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L264-L265) |
+| `GetConfig`（window_id=None） | `self.global_ipc_options` | global_ipc_options | [event.rs:326](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L326) |
+| 追加窗口创建时 | 临时 `config_overrides`（不回写） | （临时对象，清理后丢弃） | [event.rs:178-180](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L178-L180) |
+
+#### 重要场景分析
+
+**场景 1：发了无效的全局 config**
+
+```bash
+alacritty msg config no.such.field=123  # 不存在的字段
+```
+
+1. 各窗口 `add_window_config()` → `override_config()` 报错 → 从该窗口的 `window_config` 中删除
+2. `global_ipc_options.append(&mut options)` → 无效项被**追加到了 global_ipc_options**
+3. 但 `global_ipc_options` 不会立即调用 `override_config()`，所以无效项**残留**在 global 中
+
+→ 直到下次 `GetConfig`（window_id=None）触发 `global_ipc_options.override_config_rc()` 时，才会从 global 中清理掉这个无效项。
+
+**场景 2：配置文件删除了某个字段**
+
+假设配置文件本来有 `cursor.style`，IPC 设置了 `cursor.style=Beam`，之后配置文件删除了 `cursor.style` 字段。
+
+1. ConfigReload 触发 → 每个窗口 `update_config()`
+2. `update_config()` 中 `self.window_config.override_config_rc(new_config)` → `override_config()` 尝试重新应用所有 window_config 项
+3. 现在 `cursor.style` 字段不存在了 → `config.replace()` 报错 → `swap_remove(i)` 从 window_config 中删除
+4. ✅ 无效项被清理
+
+但注意：`global_ipc_options` **不会**被 ConfigReload 清理。只有等下次 `GetConfig`（window_id=None）时才会清理。
+
+**场景 3：某个窗口单独添加了无效项，其他窗口正常**
+
+```bash
+alacritty msg config --window-id 3 no.such.field=123
+```
+
+- 窗口 3 的 `window_config` 调用 `override_config()` 时发现无效 → 从窗口 3 的 window_config 中删除
+- 其他窗口不受影响
+- 不涉及 global_ipc_options（window_id != None）
+
+#### 清理机制的两个特点
+
+1. **按实例隔离**：每个 `ParsedOptions` 实例自己管理自己的无效项清理，互不影响
+2. **惰性清理**：只有在实际调用 `override_config()` 时才清理，不是"发送时"或"后台定时"清理
 
 ### 3.4 ⚠️ 关键事实：初始窗口 vs 追加窗口的配置组装差异
 
@@ -416,16 +543,16 @@ pub fn update_config(&mut self, new_config: Rc<UiConfig>) {
 
 **结论**：
 
-| 配置层 | ConfigReload 后的行为 | 是否保留 |
-|--------|----------------------|---------|
-| 基础配置（文件） | 重新加载，内容可能变 | 新内容 |
-| 启动时 CLI 覆盖 | `config::reload()` 时重新应用 | ✅ 保留（融合在基础 config 里） |
-| global_ipc_options | ConfigReload 不碰它 | ✅ 完整保留 |
-| 窗口级 window_config | 保留 + 在新基础上重新应用 | ✅ 完整保留 |
+| 配置层 | ConfigReload 后的行为 | 是否保留 | 会清理无效项吗 |
+|--------|----------------------|---------|---------------|
+| 基础配置（文件） | 重新加载，内容可能变 | 新内容 | - |
+| 启动时 CLI 覆盖 | `config::reload()` 时重新应用 | ✅ 保留（融合在基础 config 里） | ✅（reload 内部处理） |
+| global_ipc_options | ConfigReload 不碰它 | ✅ 完整保留 | ❌ **不会**（除非触发 GetConfig） |
+| 窗口级 window_config | 保留 + 在新基础上重新应用 | ✅ 完整保留 | ✅ **会**（override_config 自动清理） |
 
-→ **配置文件重新加载不会清除任何 IPC 覆盖**，所有运行时设置都保留，只是换了一层"底子"。
+→ **配置文件重新加载不会主动清除任何 IPC 覆盖**，所有运行时设置都保留，只是换了一层"底子"。
 
-→ 但是！由于 `override_config` 有**自动清理无效项**的特性（[cli.rs:385-391](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L385-L391)），如果新配置文件导致某个 IPC 覆盖项变得无效（比如字段被删除了），下次应用时会被自动清掉。
+→ 但是！由于 `override_config` 有**自动清理无效项**的特性（[cli.rs:385-391](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L385-L391)），如果新配置文件导致某个 IPC 覆盖项变得无效（比如字段被删除了），**各窗口的 window_config 会在重新应用时自动清理**，但 `global_ipc_options` 不会被清理（因为 ConfigReload 不调用它的 override_config）。
 
 #### global_ipc_options 何时重新应用？
 
@@ -436,6 +563,31 @@ pub fn update_config(&mut self, new_config: Rc<UiConfig>) {
 因为 `global_ipc_options` 的内容**已经存在每个窗口的 window_config 里了**——当初发全局 IPC Config 消息时，既更新了 global_ipc_options，也调用 add_window_config 追加到了每个窗口的 window_config 里。
 
 所以 ConfigReload 只需要重新应用 window_config 就够了，global_ipc_options 只是一个"模板"，用来给未来新建的窗口做初始化。
+
+#### global_ipc_options 的无效项何时清理？（⚠️ 修正点！）
+
+之前说"ConfigReload 时会清理"是错误的。实际上，`global_ipc_options` 的 `override_config()` 只在以下两个时机被调用：
+
+1. **GetConfig（window_id=None）**（[event.rs:326](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L326)）：
+   ```rust
+   None => &self.global_ipc_options.override_config_rc(self.config.clone()),
+   ```
+
+2. **追加窗口创建时**（[event.rs:178-180](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L178-L180)）：
+   ```rust
+   let mut config_overrides = options.config_overrides();
+   config_overrides.extend_from_slice(&self.global_ipc_options);
+   config = config_overrides.override_config_rc(config);
+   ```
+   （但这里清理的是临时 `config_overrides` 对象，不是 `global_ipc_options` 本身）
+
+所以，如果配置文件删除了某个字段，导致 global_ipc_options 中的项变得无效：
+- ✅ 各窗口的 window_config 会在 ConfigReload 时清理
+- ❌ global_ipc_options 本身**不会**被 ConfigReload 清理
+- ✅ 下次 `GetConfig`（不带 window_id）时会清理 global_ipc_options
+- ✅ 下次创建新窗口时，临时 config_overrides 会清理（但 global 本身还是脏的）
+
+这是一个潜在的不一致性：global_ipc_options 中可能残留无效项，直到下次 GetConfig 才清理。
 
 ### 3.7 GetConfig 的返回边界
 
@@ -562,9 +714,11 @@ TerminalEvent::Exit
 
 ### 配置覆盖边界
 - `global_ipc_options` 字段: [event.rs:98](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L98)
-- IPC Config 处理（含全局/窗口级分发）: [event.rs:293-318](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L293-L318)
+- IPC Config 处理（含全局/窗口级分发 + 过滤逻辑）: [event.rs:293-318](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L293-L318)
 - 初始窗口创建（无覆盖）: [event.rs:151-167](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L151-L167)
 - 追加窗口创建（有 global + 本次覆盖）: [event.rs:170-195](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L170-L195)
+- `global_ipc_options.override_config_rc()` 调用点（GetConfig 时）: [event.rs:326](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L326)
+- 窗口过滤逻辑（window_id.is_none() or window_id == Some(*id)）: [event.rs:302](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L302)
 - 窗口级覆盖应用入口: [window_context.rs:261-265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L261-L265)
 - `add_window_config()`（追加 + 重新应用）: [window_context.rs:355-363](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L355-L363)
 - `reset_window_config()`（清空 + 重新应用）: [window_context.rs:343-351](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L343-L351)
