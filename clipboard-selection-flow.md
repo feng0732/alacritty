@@ -452,19 +452,100 @@ event.rs: 事件循环处理
    },
    ```
 
-### 5.4 安全机制
+### 5.4 安全机制的层级分布
 
-1. **配置权限**：`osc52` 选项控制
-   - `Disabled`：完全禁止
-   - `OnlyCopy`：只允许写入
-   - `OnlyPaste`：只允许读取
-   - `CopyPaste`：双向允许
+配置检查、焦点检查和剪贴板访问分布在不同的代码层级，职责边界清晰：
 
-2. **焦点检查**：只有窗口获得焦点时才执行，防止后台终端窃取剪贴板
+```
+┌────────────────────────────────────────────────────────────┐
+│  UI 层 (alacritty crate)                                    │
+│                                                            │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ event.rs: 事件循环                                   │   │
+│  │  ┌─ 焦点检查 ───────────────────────────────────┐    │   │
+│  │  │ ClipboardStore: if is_focused { store() }    │    │   │
+│  │  │ ClipboardLoad: if is_focused { load()+写回 } │    │   │
+│  │  └──────────────────────────────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                         │                                  │
+│  ┌──────────────────────▼─────────────────────────────┐   │
+│  │ clipboard.rs: 平台剪贴板访问                         │   │
+│  │  - store(ty, text):  实际写入系统剪贴板              │   │
+│  │  - load(ty):        实际读取系统剪贴板              │   │
+│  │  - 处理 X11/Wayland/macOS/Windows 平台差异          │   │
+│  └─────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────┘
+                            ▲
+                            │  Event::ClipboardStore/Load
+                            │
+┌────────────────────────────────────────────────────────────┐
+│  终端核心层 (alacritty_terminal crate)                      │
+│                                                            │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ term/mod.rs: 终端状态机                               │   │
+│  │  ┌─ 配置权限检查 ─────────────────────────────┐      │   │
+│  │  │ clipboard_store: 检查 config.osc52         │      │   │
+│  │  │   (OnlyCopy|CopyPaste 才放行)              │      │   │
+│  │  │ clipboard_load:  检查 config.osc52         │      │   │
+│  │  │   (OnlyPaste|CopyPaste 才放行)             │      │   │
+│  │  └────────────────────────────────────────────┘      │   │
+│  │                                                      │   │
+│  │  is_focused 字段：焦点状态存储（不做检查，只存值）   │   │
+│  └─────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────┘
+```
 
-3. **内容编码**：Base64 编码传输，避免特殊字符问题
+**层级职责边界总结：**
 
-### 5.5 与用户复制/粘贴的对比
+| 检查/操作 | 所在层级 | 代码位置 | 说明 |
+|----------|----------|----------|------|
+| osc52 配置权限检查 | **终端核心层** | [term/mod.rs#L1705-L1709](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1705-L1709)、[L1726-L1730](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1726-L1730) | 不通过就不发事件 |
+| is_focused 状态存储 | **终端核心层** | [term/mod.rs#L270](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L270) | 只存值，不做检查逻辑 |
+| 焦点检查 | **UI 层** | [event.rs#L1902-L1905](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L1902-L1905)、[L1907-L1911](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L1907-L1911) | 事件处理时判断 |
+| 实际剪贴板读写 | **UI 层** | [clipboard.rs](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/clipboard.rs) | 平台相关代码 |
+| is_focused 状态更新 | **UI 层** | [event.rs#L1985-L1986](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L1985-L1986) | 窗口事件触发 |
+
+**OSC 52 两层检查的执行顺序：**
+
+```
+终端程序发 OSC 52 序列
+    │
+    ▼
+终端核心层：clipboard_store/load()
+    │
+    ├─ osc52 配置权限检查 → 不通过 → 直接返回（不发事件）
+    │      [term/mod.rs]
+    │
+    └─ 通过 → 发送 Event::ClipboardStore/Load
+            │
+            ▼
+UI 层：事件循环处理
+    │
+    ├─ is_focused 焦点检查 → 不通过 → 直接返回（不访问剪贴板）
+    │      [event.rs]
+    │
+    └─ 通过 → 调用 clipboard.store/load()
+            │
+            ▼
+UI 层：实际平台剪贴板访问
+    [clipboard.rs]
+```
+
+### 5.5 用户复制/粘贴 vs OSC 52 的安全检查差异
+
+| 检查项 | 用户复制/粘贴 | OSC 52 写入/读取 |
+|--------|--------------|-----------------|
+| osc52 配置权限 | **不检查**（用户主动操作） | **检查**（终端层入口） |
+| is_focused 焦点 | **不检查**（用户直接操作） | **检查**（UI 层入口） |
+| 剪贴板访问 | 直接调用 clipboard.store/load | 事件触发后调用 |
+
+用户复制/粘贴代码位置：
+- `copy_selection()` — [event.rs#L744-L754](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L744-L754)：**无任何检查**，直接 `store`
+- `Action::Paste` — [input/mod.rs#L327-L330](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/input/mod.rs#L327-L330)：**无任何检查**，直接 `load` + `paste`
+
+这是合理的：用户主动操作默认可信，终端程序发起的操作需要严格限制。
+
+### 5.6 与用户复制/粘贴的对比
 
 | 维度 | 用户复制 | OSC 52 写入 | 用户粘贴 | OSC 52 读取 |
 |------|----------|-------------|----------|-------------|
