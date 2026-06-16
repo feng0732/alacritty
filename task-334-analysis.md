@@ -650,38 +650,53 @@ if *self.active_tex != self.batch.tex() {
 
 ### 2.1.6 异常降级与容错机制
 
-#### 渲染器自动选择与降级
+#### 降级与容错的边界澄清
 
-**选择逻辑** [renderer/mod.rs#L119-L162](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/mod.rs#L119-L162)
+在深入分析之前，先明确一个关键事实：
+
+- **真正的自动降级**（运行时检测能力，不满足则回退）：仅 **DSB 双源混合扩展** 一处
+- **初始化时的能力选择**（一次性决策，不回退）：渲染器后端选择（GLSL3 vs GLES2）
+- **容错机制**（出错后尽量继续运行）：缺字回退、字形过大降级、字体加载降级等
+- **硬性失败**（直接 panic 或返回 Error）：Shader 编译失败、GPU 上下文重建失败
+
+---
+
+#### 渲染器后端选择：一次性决策，无自动降级链
+
+`Renderer::new()` 只尝试创建**一种**渲染器后端，失败则直接返回 `Error`，不存在 GLSL3 → GLES2 → Gles2Pure 的自动降级链。
+
+**选择逻辑** [renderer/mod.rs#L119-L162](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/mod.rs#L119-L162)：
 
 ```rust
 pub fn new(
     context: &PossiblyCurrentContext,
     renderer_preference: Option<RendererPreference>,
 ) -> Result<Self, Error> {
-    // 1. 加载 OpenGL 函数（首次调用时执行）
+    // 1. 加载 OpenGL 函数（首次调用时执行，原子标志确保只加载一次）
     if !GL_FUNS_LOADED.swap(true, Ordering::Relaxed) {
         let gl_display = context.display();
         gl::load_with(|symbol| gl_display.get_proc_address(...).cast());
     }
     
-    // 2. 查询 GPU 信息
+    // 2. 查询 GPU 信息（shader 版本、GL 版本、渲染器）
     let shader_version = gl_get_string(gl::SHADING_LANGUAGE_VERSION, ...)?;
     let gl_version = gl_get_string(gl::VERSION, ...)?;
     
-    // 3. 决定使用哪个渲染器
+    // 3. 决定使用哪个渲染器（只选一种）
     let is_gles_context = matches!(context.context_api(), ContextApi::Gles(_));
     
     let (use_glsl3, allow_dsb) = match renderer_preference {
-        // 用户强制指定
+        // 用户强制 Glsl3 → 只试 GLSL3
         Some(RendererPreference::Glsl3) => (true, true),
+        // 用户强制 Gles2 → 只试 GLES2（允许 DSB 自动检测）
         Some(RendererPreference::Gles2) => (false, true),
-        Some(RendererPreference::Gles2Pure) => (false, false),  // 禁用 DSB
-        // 自动选择：Shader >= 3.3 且非 GLES 上下文用 GLSL3
+        // 用户强制 Gles2Pure → 只试纯 GLES2（禁用 DSB）
+        Some(RendererPreference::Gles2Pure) => (false, false),
+        // 自动选择：shader >= 3.3 且非 GLES 上下文用 GLSL3
         None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
     };
     
-    // 4. 创建渲染器（失败会返回 Error）
+    // 4. 创建渲染器（失败用 ? 直接返回 Error，不回退）
     let (text_renderer, rect_renderer) = if use_glsl3 {
         let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
         let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
@@ -695,27 +710,20 @@ pub fn new(
 }
 ```
 
-**三级渲染降级路径**：
+**Display 层调用处也没有降级** [display/mod.rs#L439](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/display/mod.rs#L439)：
 
-```
-RendererPreference::Glsl3
-    │
-    ├─ GLSL3 初始化成功 → 使用 Glsl3Renderer
-    │
-    └─ 失败（Shader 编译错误等）
-         │
-         └─ 降级到 Gles2Renderer（带 DSB）
-              │
-              ├─ 成功 → 使用
-              │
-              └─ 失败 → 降级到 Gles2Pure（纯 GLES2，无 DSB）
+```rust
+let mut renderer = Renderer::new(&context, config.debug.renderer)?;
+// 用 ? 直接向上传播错误，不做回退尝试
 ```
 
-> **注意**：自动降级需要在调用层实现（如果 Glsl3Renderer::new() 失败，可以捕获 Error 并重试 Gles2）。
+> **关键结论**：渲染器后端选择是**一次性决策**。如果所选渲染器初始化失败（如 shader 编译错误、链接失败），整个程序初始化失败，不会自动尝试降级到备用后端。
+>
+> 如果需要实现降级，需要在调用层（如 main 函数）自行捕获 Error 并重试不同的 `RendererPreference`。
 
-#### GLES2 内部的 DSB 自动降级
+#### GLES2 内部的 DSB 自动降级（唯一的运行时自动降级点）
 
-Gles2Renderer 内部会自动检测双源混合扩展支持：
+Gles2Renderer 内部会自动检测双源混合（Dual Source Blending）扩展支持，这是**唯一一处**运行时自动降级：
 
 ```rust
 // [gles2.rs#L40-L56]
@@ -741,7 +749,7 @@ pub fn new(shader_version: ShaderVersion, dual_source_blending: bool) -> Result<
 }
 ```
 
-#### GPU 上下文丢失与恢复
+#### GPU 上下文丢失与重建
 
 **健壮性扩展检测** [renderer/mod.rs#L304-L321](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/mod.rs#L304-L321)
 
@@ -764,12 +772,14 @@ fn supports_robustness() -> bool {
 }
 ```
 
+> **注意**：如果不支持 `GL_KHR_robustness` 扩展或策略不是 `LOSE_CONTEXT_ON_RESET`，`robustness` 为 `false`，`was_context_reset()` 永远返回 `false`，程序将无法检测 GPU 重置。
+
 **上下文重置检测** [renderer/mod.rs#L281-L302](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/mod.rs#L281-L302)
 
 ```rust
 pub fn was_context_reset(&self) -> bool {
     if !self.robustness {
-        return false;
+        return false;  // 不支持健壮性扩展，无法检测
     }
     
     let status = unsafe { gl::GetGraphicsResetStatus() };
@@ -788,11 +798,85 @@ pub fn was_context_reset(&self) -> bool {
 }
 ```
 
-**恢复流程**（在 Display::make_current 中）：
+**两种检测路径** [display/mod.rs#L556-L574](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/display/mod.rs#L556-L574)：
 
-1. 调用 `renderer.was_context_reset()` 检测重置
-2. 检测到重置后，重建 GL context、Renderer、GlyphCache
-3. 标记全屏 damage，触发完整重绘
+```rust
+pub fn make_current(&mut self) {
+    let is_current = self.context.is_current();
+    
+    let context_loss = if is_current {
+        // 路径 1: 上下文已是 current，通过 robustness 扩展检测
+        self.renderer.was_context_reset()
+    } else {
+        // 路径 2: 上下文不是 current，通过 make_current 的返回值检测
+        match self.context.make_current(&self.surface) {
+            Err(err) if err.error_kind() == ErrorKind::ContextLost => {
+                info!("Context lost for window {:?}", self.window.id());
+                true
+            },
+            _ => false,
+        }
+    };
+    
+    if !context_loss {
+        return;  // 没有丢失，正常返回
+    }
+    // ... 执行重建 ...
+}
+```
+
+**完整重建流程** [display/mod.rs#L576-L604](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/display/mod.rs#L576-L604)：
+
+```rust
+// 1. 保存旧 display/config 引用
+let gl_display = self.context.display();
+let gl_config = self.context.config();
+let raw_window_handle = Some(self.window.raw_window_handle());
+
+// 2. 创建新的 GL context
+let context = platform::create_gl_context(&gl_display, &gl_config, raw_window_handle)
+    .expect("failed to recreate context.");  // 失败直接 panic
+
+// 3. 销毁旧的 renderer 和 context（ManuallyDrop 手动释放）
+unsafe {
+    ManuallyDrop::drop(&mut self.renderer);
+    ManuallyDrop::drop(&mut self.context);
+}
+
+// 4. 激活新 context
+let context = context.treat_as_possibly_current();
+self.context = ManuallyDrop::new(context);
+self.context.make_current(&self.surface)
+    .expect("failed to reativate context after reset.");
+
+// 5. 重建 renderer（使用相同的 renderer_preference，不降级）
+let renderer = Renderer::new(&self.context, self.renderer_preference)
+    .expect("failed to recreate renderer after reset");  // 失败直接 panic
+self.renderer = ManuallyDrop::new(renderer);
+
+// 6. 调整 renderer 尺寸
+self.renderer.resize(&self.size_info);
+
+// 7. 重置字形缓存
+self.reset_glyph_cache();
+
+// 8. 标记全屏损伤，触发完整重绘
+self.damage_tracker.frame().mark_fully_damaged();
+```
+
+**重建的边界与限制**：
+
+| 边界情况 | 行为 |
+|---------|------|
+| 不支持 `GL_KHR_robustness` | 无法检测 GPU 重置，遇到重置会直接崩溃或渲染异常 |
+| 重建 GL context 失败 | `expect("failed to recreate context")` → **panic** |
+| 重建 Renderer 失败 | `expect("failed to recreate renderer after reset")` → **panic** |
+| 重建时的渲染器类型 | 使用原有的 `renderer_preference`，**不降级** |
+| 字形缓存 | 完全重置，重新加载常用字形 |
+| 损伤状态 | 全屏标记为脏，下一帧完整重绘 |
+| 触发时机 | 每次 `make_current()` 时检测，通常在渲染前调用 |
+
+> **关键结论**：GPU 上下文重建是一种"尽力而为"的恢复机制。如果重建失败，程序直接 panic 崩溃。不存在"GLSL3 重建失败就回退到 GLES2"的降级逻辑。
 
 #### 字形加载容错机制
 
@@ -902,52 +986,9 @@ pub enum RendererPreference {
     Glsl3,      // 强制 OpenGL 3.3
     Gles2,      // 强制 GLES2（自动启用 DSB 如果支持）
     Gles2Pure,  // 纯 GLES2（禁用 DSB）
-}
 ```
 
 ---
-
-#### 字形缓存 (`GlyphCache`)
-
-文件: [renderer/text/glyph_cache.rs](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/text/glyph_cache.rs)
-
-**职责**:
-- 管理字体光栅化器（Rasterizer）
-- 缓存已光栅化的字形（HashMap<GlyphKey, Glyph>）
-- 支持 4 种字体样式：常规、粗体、斜体、粗斜体
-- 内置字体用于盒绘字符（builtin_box_drawing）
-
-#### 纹理图集 (`Atlas`)
-
-文件: [renderer/text/atlas.rs](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/text/atlas.rs)
-
-**职责**:
-- 将字形打包到 OpenGL 纹理中
-- 支持多图集（图集满了自动创建新的）
-- 管理 GPU 纹理上传
-
-#### 矩形渲染器 (`RectRenderer`)
-
-文件: [renderer/rects.rs](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/rects.rs)
-
-**职责**:
-- 绘制各种矩形元素：光标、下划线、删除线、视觉铃声、搜索高亮等
-- 支持 4 种矩形类型：普通、波浪下划线、点状下划线、虚线下划线
-- 每种类型使用独立的 shader program
-
-**关键结构体**:
-- `RenderRect` — 单个矩形（位置、尺寸、颜色、透明度、类型）
-- `RenderLine` — 一行的线段描述（可转换为多个 RenderRect）
-- `RenderLines` — 线段收集器，按 flag 分组合并相邻线段
-
-#### 着色器管理 (`shader.rs`)
-
-文件: [renderer/shader.rs](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/shader.rs)
-
-**职责**:
-- 编译和链接着色器程序
-- 管理 uniform 变量
-- 支持 ShaderVersion::Gles2 和 ShaderVersion::Glsl3
 
 ### 2.2 显示管理层 (`alacritty/src/display/`)
 
