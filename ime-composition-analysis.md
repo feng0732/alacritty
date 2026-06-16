@@ -279,15 +279,20 @@ let ime_popup_point = match preedit.cursor_end_offset {
 ─────────────────────────────────────────────────────────────────────────────────
 T0  正常状态                                           可见(Beam)    -          -
 T1  按 'n' 键                                          可见(Beam)    -          -
-T2  Ime::Preedit("n", Some((0,1)))                     Hidden        -          Beam
+T2  Ime::Preedit("n", Some((0,1))) 到达                Hidden        -          Beam
 T3  按 'i' 键                                          Hidden        -          Beam
-T4  Ime::Preedit("ni", Some((0,2)))                    Hidden        -          Beam
-T5  候选窗口选择"你"                                     Hidden        -          -
-T6  Ime::Commit("你")  → paste("你", false) → PTY      可见(Beam)    -          -
-T7  Ime::Preedit("", None) → preedit 清空              可见(Beam)    -          -
+T4  Ime::Preedit("ni", Some((0,2))) 到达               Hidden        -          Beam
+T5  候选窗口弹出，用户选择"你"（preedit 仍活跃）         Hidden        -          Beam
+T6  Ime::Commit("你") 到达 → paste → PTY               Hidden        -          Beam
+T7  Ime::Preedit("", None) 到达 → preedit 清空         可见(Beam)    -          -
 ```
 
-注意 T6-T7 的顺序：Commit 和 Preedit("") 是两个独立事件。Commit 先到达，此时 preedit 仍为 `Some`，终端光标仍为 Hidden。随后 Preedit("") 到达，preedit 被清除为 None，下一帧渲染时光标恢复。
+**关键状态说明**：
+
+- **T6（Commit 到达时）**：`Ime::Commit` 的处理逻辑仅调用 `paste()` 发送文本到 PTY，**完全不修改 preedit 状态**（见 [alacritty/src/event.rs#L2019-L2024](alacritty/src/event.rs#L2019-L2024)）。所以此时 `display.ime.preedit()` 仍然是 `Some(...)`，终端光标保持 Hidden，IME 光标也仍在渲染。
+- **T7（Preedit 空文本到达时）**：`Ime::Preedit("", None)` 触发 `set_preedit(None)`（见 [alacritty/src/event.rs#L2025-L2033](alacritty/src/event.rs#L2025-L2033)），preedit 被清空为 `None`。下一帧渲染时，[content.rs#L55](alacritty/src/display/content.rs#L55) 的 `display.ime.preedit().is_some()` 条件为 false，终端光标恢复原始形状可见。
+
+> 💡 平台差异提示：winit 在不同平台上 Commit 与 Preedit("") 的事件到达顺序可能略有不同（有的平台先 Commit 再 Preedit("")，有的反之）。但无论顺序如何，**Commit 本身不清除 preedit** 是确定的——光标恢复的唯一触发点是 Preedit 空文本事件。
 
 ### 4.2 搜索模式下用 IME 输入搜索词
 
@@ -295,14 +300,18 @@ T7  Ime::Preedit("", None) → preedit 清空              可见(Beam)    -    
 时间线                     事件                        终端光标    搜索栏光标    IME光标
 ─────────────────────────────────────────────────────────────────────────────────
 T0  搜索活跃，光标在搜索栏                              Hidden      Underline    -
-T1  Ime::Preedit("n", Some((0,1)))                     Hidden        -          Beam
-T2  Ime::Preedit("ni", Some((0,2)))                    Hidden        -          Beam
-T3  Ime::Commit("你")  → paste("你", false)            Hidden        -          -
-    → search_active() → search_input('你')
-T4  Ime::Preedit("", None) → preedit 清空              Hidden      Underline    -
+T1  Ime::Preedit("n", Some((0,1))) 到达                Hidden        -          Beam
+T2  Ime::Preedit("ni", Some((0,2))) 到达               Hidden        -          Beam
+T3  Ime::Commit("你") 到达 → paste → search_input      Hidden        -          Beam
+T4  Ime::Preedit("", None) 到达 → preedit 清空         Hidden      Underline    -
 ```
 
 搜索模式下终端光标始终为 Hidden（因为 `search_state.regex().is_some()` 为 true），preedit 仅影响搜索栏光标的可见性。
+
+**状态一致性说明**：
+
+- **T3（Commit 到达时）**：同普通模式，Commit 不修改 preedit，所以搜索栏光标仍然隐藏（preedit 活跃），IME 光标仍然显示 Beam。
+- **T4（Preedit 空文本到达时）**：preedit 清空为 None，搜索栏的 Underline 光标重新出现（见 [alacritty/src/display/mod.rs#L929-L937](alacritty/src/display/mod.rs#L929-L937) 的 `if self.ime.preedit().is_none()` 条件）。
 
 ---
 
@@ -342,6 +351,8 @@ if key.state == ElementState::Released {
 ```
 
 这确保了内联搜索等待字符输入时 IME 被启用，用户可以用 IME 输入搜索字符。一旦字符被接收，IME 立即被重新禁用（见 `inline_search_input()` 中的 [alacritty/src/event.rs#L1474](alacritty/src/event.rs#L1474)）。
+
+> **注意**：`set_ime_inhibitor(VI, true)` 是同步调用 `set_ime_allowed(false)` 通知窗口系统禁用 IME，但 IME 的实际状态变化（`Ime::Disabled` 事件、preedit 清空等）是异步回调。因此 T4 时刻 VI 抑制器已置 ON，但 preedit 可能仍短暂残留，直到后续 `Ime::Disabled` 或 `Ime::Preedit("", None)` 事件到达后才真正清除。
 
 同时，[alacritty/src/input/keyboard.rs#L23-L26](alacritty/src/input/keyboard.rs#L23-L26) 的键盘互斥：
 
