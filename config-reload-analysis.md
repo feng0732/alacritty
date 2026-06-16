@@ -17,7 +17,7 @@
 
 ## 二、启动阶段：ConfigMonitor 的创建
 
-入口在 [alacritty/src/main.rs](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/main.rs) 的 `alacritty()` 函数，它调用 `Processor::new()`，后者在 [alacritty/src/event.rs:126-L128](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/event.rs#L126-L128) 中：
+入口在 `alacritty/src/main.rs` 的 `alacritty()` 函数，它调用 `Processor::new()`，后者在 `alacritty/src/event.rs:126-128` 中：
 
 ```rust
 if config.live_config_reload() {
@@ -32,7 +32,7 @@ if config.live_config_reload() {
 
 ## 三、ConfigMonitor::new() 实现
 
-完整代码：[alacritty/src/config/monitor.rs:33-L155](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/config/monitor.rs#L33-L155)
+完整代码位于 `alacritty/src/config/monitor.rs:33-155`。
 
 ### 3.1 路径预处理（四步）
 
@@ -69,7 +69,7 @@ let mut watcher = RecommendedWatcher::new(tx.clone(), Config::default().with_pol
 
 ### 3.3 防抖算法
 
-[alacritty/src/config/monitor.rs:92-L141](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/config/monitor.rs#L92-L141)
+代码位于 `alacritty/src/config/monitor.rs:92-141`。
 
 常量：`DEBOUNCE_DELAY = 10ms`
 
@@ -113,7 +113,7 @@ loop {
 
 ### 3.5 关机机制
 
-[alacritty/src/config/monitor.rs:158-L168](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/config/monitor.rs#L158-L168)
+代码位于 `alacritty/src/config/monitor.rs:158-168`。
 
 ```rust
 pub fn shutdown(self) {
@@ -130,7 +130,7 @@ pub fn shutdown(self) {
 
 ## 四、主线程处理 ConfigReload 事件
 
-代码：[alacritty/src/event.rs:343-L371](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/event.rs#L343-L371)
+代码位于 `alacritty/src/event.rs:343-371`。
 
 ```rust
 (EventType::ConfigReload(path), _) => {
@@ -164,7 +164,7 @@ pub fn shutdown(self) {
 
 **步骤 2（config::reload）** 的内部流程：
 
-[alacritty/src/config/mod.rs:150-L159](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/config/mod.rs#L150-L159) → `load_from()` → `read_config()` → `parse_config()`
+`alacritty/src/config/mod.rs:150-159` → `load_from()` → `read_config()` → `parse_config()`
 
 ```
 parse_config(path, config_paths, recursion_limit)
@@ -187,10 +187,13 @@ parse_config(path, config_paths, recursion_limit)
 
 ### 5.1 函数定义
 
-[alacritty/src/config/monitor.rs:170-L176](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/config/monitor.rs#L170-L176)
+代码位于 `alacritty/src/config/monitor.rs:170-176`。
 
 ```rust
 /// Check if the config monitor needs to be restarted.
+///
+/// This checks the supplied list of files against the monitored files to determine if a
+/// restart is necessary.
 pub fn needs_restart(&self, files: &[PathBuf]) -> bool {
     Self::hash_paths(files).is_none_or(|hash| Some(hash) == self.watched_hash)
 }
@@ -198,7 +201,7 @@ pub fn needs_restart(&self, files: &[PathBuf]) -> bool {
 
 ### 5.2 逐步推演
 
-`is_none_or(f)` 的语义：
+`is_none_or(f)` 的语义（Rust 标准库 `Option` 方法）：
 - 若 `Option` 为 `None` → 返回 `true`
 - 若 `Option` 为 `Some(v)` → 返回 `f(v)`
 
@@ -237,7 +240,7 @@ pub fn needs_restart(&self, files: &[PathBuf]) -> bool {
 
 ### 5.5 hash_paths 的实现
 
-[alacritty/src/config/monitor.rs:179-L197](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/config/monitor.rs#L179-L197)
+代码位于 `alacritty/src/config/monitor.rs:179-197`。
 
 ```rust
 fn hash_paths(files: &[PathBuf]) -> Option<u64> {
@@ -262,7 +265,7 @@ fn hash_paths(files: &[PathBuf]) -> Option<u64> {
 
 ### 5.6 watched_hash 与 config_paths 的一致性
 
-- `watched_hash`：在 [alacritty/src/config/monitor.rs:40](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/config/monitor.rs#L40) 计算，输入是 `ConfigMonitor::new()` 接收的**原始 `paths` 参数**（即 `config.config_paths` 的 clone）
+- `watched_hash`：在 `alacritty/src/config/monitor.rs:40` 计算，输入是 `ConfigMonitor::new()` 接收的**原始 `paths` 参数**（即 `config.config_paths` 的 clone）
 - `needs_restart` 的 `files` 参数：来自重载后的 `self.config.config_paths`
 
 两者都是 `parse_config` 中 `config_paths.push(path.to_owned())` 收集的原始路径，未经过 canonicalize，因此**哈希具有可比性**。
@@ -332,7 +335,7 @@ fn hash_paths(files: &[PathBuf]) -> Option<u64> {
 
 ## 七、窗口级配置应用
 
-[alacritty/src/window_context.rs:261-L333](file:///d:/fz/0601/solo-dogfeeding/code/338-alacritty/alacritty/src/window_context.rs#L261-L333)
+代码位于 `alacritty/src/window_context.rs:261-333`。
 
 `update_config()` 通过 `mem::replace` 保留旧配置，逐一对比新旧差异：
 
