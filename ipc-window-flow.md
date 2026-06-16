@@ -118,67 +118,141 @@ let window_id = ipc_config.window_id
 
 ---
 
-## 三、配置覆盖边界：影响谁？
+## 三、配置覆盖机制详解
 
-### 3.1 三层配置覆盖模型
+### 3.1 覆盖底层：ParsedOptions 如何工作
 
-Alacritty 的配置是一个**洋葱式叠加**结构，从内到外依次生效：
+理解优先级之前，先搞清楚 `ParsedOptions` 的内部实现（[cli.rs:356-425](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L356-L425)）：
+
+**数据结构**：
+```rust
+pub struct ParsedOptions {
+    config_options: Vec<(String, Value)>,  // 顺序存储的 (原始字符串, TOML 值) 列表
+}
+```
+
+**核心方法 `override_config()`**（[cli.rs:381-396](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L381-L396)）：
+```rust
+pub fn override_config(&mut self, config: &mut UiConfig) {
+    let mut i = 0;
+    while i < self.config_options.len() {
+        let (option, parsed) = &self.config_options[i];
+        match config.replace(parsed.clone()) {
+            Err(err) => {
+                // 无效选项 → 从列表中移除（swap_remove）
+                self.config_options.swap_remove(i);
+            },
+            Ok(_) => i += 1,  // 有效 → 继续下一个
+        }
+    }
+}
+```
+
+**两个关键特性**：
+
+1. **顺序决定优先级**：按 Vec 顺序依次调用 `config.replace()`，**后出现的同名配置会覆盖先出现的**（因为后调用的 replace 会覆盖前一次的结果）
+2. **失败自动清理**：如果某个 option 无效（字段不存在或类型错误），会从列表中删除，下次重新应用时不会再报错
+
+**追加方式**：
+- `extend_from_slice(other)`：把另一个 ParsedOptions 的内容追加到末尾（[cli.rs:421-424](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L421-L424) 通过 `DerefMut` 实现）
+- 追加在末尾的优先级更高
+
+### 3.2 三层配置覆盖模型
+
+Alacritty 的配置是一个**洋葱式叠加**结构，从内到外（优先级从低到高）依次是：
 
 ```
-┌──────────────────────────────────────────────────┐
-│  第 1 层：基础配置 (Rc<UiConfig>)                │
-│  来自配置文件 + 启动时 CLI 参数（一次性解析）      │
-└───────────────────┬──────────────────────────────┘
-                    │
-                    ▼
-┌──────────────────────────────────────────────────┐
-│  第 2 层：全局 IPC 覆盖 (global_ipc_options)     │
-│  Processor 持有，window_id=None 的 Config 消息设置│
-│  影响：所有后续新建的追加窗口 + 可回刷已有窗口     │
-└───────────────────┬──────────────────────────────┘
-                    │
-                    ▼
-┌──────────────────────────────────────────────────┐
-│  第 3 层：窗口级覆盖 (window_config)             │
-│  每个 WindowContext 独立持有                     │
-│  影响：仅当前窗口                                │
-└──────────────────────────────────────────────────┘
+低优先级 ──────────────────────────────────────────────── 高优先级
+
+┌─────────────────┐  ┌────────────────────┐  ┌────────────────────┐
+│  基础配置       │  │  全局 IPC 覆盖     │  │  窗口级覆盖         │
+│  (config file)  │  │  (global_ipc_...)  │  │  (window_config)   │
+└────────┬────────┘  └─────────┬──────────┘  └─────────┬──────────┘
+         │                     │                        │
+         └─────────────────────┴────────────────────────┘
+                               │
+                               ▼
+                      最终生效的 config
 ```
 
 关键代码：
-- 全局覆盖：[event.rs:98](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L98) `global_ipc_options: ParsedOptions`
-- 窗口级覆盖：[window_context.rs:68](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L68) `window_config: ParsedOptions`
-- 窗口级应用：[window_context.rs:265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L265) `self.config = self.window_config.override_config_rc(self.config.clone())`
+- 全局覆盖存储：[event.rs:98](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L98) `global_ipc_options: ParsedOptions`
+- 窗口级覆盖存储：[window_context.rs:68](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L68) `window_config: ParsedOptions`
+- 窗口级应用入口：[window_context.rs:265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L265) `self.config = self.window_config.override_config_rc(...)`
 
-### 3.2 IPC Config 消息的作用边界
+### 3.3 冲突优先级：同一项谁覆盖谁？
 
-**`alacritty msg config` 有两种作用范围**，由 `--window-id` 决定：
+这是核心问题。当多层覆盖针对**同一个配置项**时，优先级如下（高优先级覆盖低优先级）：
 
-| window_id | 作用范围 | 对既有窗口 | 对后续新窗口 | 代码行 |
-|-----------|----------|-----------|-------------|--------|
-| **具体正整数** | 单个指定窗口 | ✅ 立即应用（add_window_config） | ❌ 不影响 | [event.rs:299-308](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L299-L308) |
-| **None / -1**（全局） | 全部窗口 + 全局存储 | ✅ 所有窗口立即应用 | ✅ 存入 global_ipc_options，追加窗口继承 | [event.rs:311-318](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L311-L318) |
+| 优先级 | 覆盖来源 | 适用场景 |
+|--------|---------|----------|
+| 🏆 最高 | 后发的 IPC Config 消息 | 同一条路径上多次调用 config，后发的赢 |
+| 🥈 次高 | 窗口级覆盖（window_config） | 窗口专属的配置 |
+| 🥉 中 | 全局 IPC 覆盖（global_ipc_options） | 全局运行时设置 |
+| 最低 | 基础配置（配置文件 + 启动 CLI） | 底层默认值 |
 
-**执行流程图**（[event.rs:293-318](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L293-L318)）：
+下面分场景拆解：
 
-```
-收到 IpcConfig 事件
-    │
-    ├─ 步骤 1: 解析 options 为 ParsedOptions
-    │
-    ├─ 步骤 2: 遍历匹配的窗口（window_id 过滤）
-    │     │
-    │     └─ 每个窗口: reset ? reset_window_config() : add_window_config()
-    │
-    └─ 步骤 3: 如果 window_id.is_none()（全局）
-           │
-           ├─ reset ? global_ipc_options.clear()
-           └─ 否则  ? global_ipc_options.append()
+#### 场景 A：多次 IPC Config 消息作用于同一个窗口
+
+每次 `alacritty msg config` 调用 `add_window_config()`，会把新的 options **追加**到 `window_config` 末尾（[window_context.rs:359](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L359)）：
+
+```rust
+pub fn add_window_config(&mut self, config: Rc<UiConfig>, options: &ParsedOptions) {
+    self.window_config.extend_from_slice(options);  // 追加到末尾
+    self.update_config(config);
+}
 ```
 
-### 3.3 ⚠️ 关键事实：初始窗口 vs 追加窗口的配置组装差异
+→ **后发的 config 消息优先级更高**，同名字段会覆盖之前的。
 
-这是之前理解有误的核心点。**两条创建路径的配置组装方式完全不同**：
+#### 场景 B：全局 IPC Config vs 窗口级 IPC Config
+
+假设有这样的操作序列：
+```bash
+alacritty msg config cursor.style=Beam          # 全局设置（window_id=None）
+alacritty msg config --window-id 3 cursor.style=Underline  # 只改窗口 3
+```
+
+对于窗口 3 来说：
+1. 第一步全局 config → 窗口 3 的 `window_config` 追加了 `cursor.style=Beam`
+2. 第二步窗口级 config → 窗口 3 的 `window_config` 又追加了 `cursor.style=Underline`
+3. `window_config` 顺序：[Beam, Underline]
+4. 应用时后出现的 Underline 覆盖 Beam → **窗口级赢**
+
+对于窗口 1（没发过窗口级 config）：
+- 只有 Beam → 全局设置生效
+
+**结论**：窗口级 IPC Config 的优先级高于全局 IPC Config（因为后追加到 window_config）。
+
+#### 场景 C：CreateWindow 自带 options vs 全局 IPC 覆盖
+
+**仅适用于追加窗口**（初始窗口不应用任何 IPC 覆盖）。
+
+代码（[event.rs:177-180](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L177-L180)）：
+```rust
+let mut config_overrides = options.config_overrides();     // ① 先放 CreateWindow 自带的
+config_overrides.extend_from_slice(&self.global_ipc_options);  // ② 再追加全局的
+```
+
+→ global 在后面 → **global_ipc_options 优先级 > CreateWindow 自带 options**
+
+这个设计有点反直觉（通常更具体的应该优先级更高），但代码确实是这样写的。
+
+#### 场景 D：创建窗口后再发全局 Config
+
+```bash
+alacritty msg create-window -o cursor.style=Beam     # 窗口创建时自带 Beam
+alacritty msg config cursor.style=Underline          # 后续全局设置 Underline
+```
+
+创建时：`window_config = [Beam, global(空)]`
+后续全局 config：`window_config` 追加 `Underline` → `[Beam, Underline]`
+→ Underline 在后面 → **后续全局 config 覆盖创建时自带的 option**
+
+### 3.4 ⚠️ 关键事实：初始窗口 vs 追加窗口的配置组装差异
+
+两条创建路径的配置组装方式**完全不同**：
 
 #### 路径 A：初始窗口（create_initial_window）
 
@@ -193,7 +267,7 @@ let window_context = WindowContext::initial(
     event_loop,
     self.proxy.clone(),
     self.config.clone(),   // ← 只有基础配置
-    window_options,        // ← 但 options.option 不会被应用到 config
+    window_options,        // ← options.option 不会被应用到 config
 )?;
 ```
 
@@ -227,8 +301,9 @@ let window_context = WindowContext::additional(
 )?;
 ```
 
-→ **追加窗口 = 基础配置 + global_ipc_options + 本次 IPC options**
-→ **追加窗口的 window_config = global_ipc_options + 本次 IPC options**
+→ **追加窗口 = 基础配置 + CreateWindow 自带 options + global_ipc_options**
+→ **追加窗口的 window_config = CreateWindow 自带 options + global_ipc_options**
+→ （注：global 在后面，优先级更高）
 
 在 `WindowContext::additional()` 中可以确认（[window_context.rs:163](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L163)）：
 ```rust
@@ -241,9 +316,9 @@ window_context.window_config = config_overrides;  // 存入！
 |---------|---------|---------|
 | 基础配置文件 | ✅ | ✅ |
 | 启动时 CLI 覆盖 | ✅（已融合进基础 config） | ✅（已融合进基础 config） |
-| global_ipc_options（运行时全局） | ❌ **不继承** | ✅ 继承 |
-| 本次 CreateWindow 的 -o options | ❌ **不应用** | ✅ 应用 |
-| window_config 存储内容 | 空 | global + 本次 options |
+| global_ipc_options（运行时全局） | ❌ **不继承** | ✅ 继承（优先级高于 CreateWindow options） |
+| 本次 CreateWindow 的 -o options | ❌ **不应用** | ✅ 应用（优先级低于 global） |
+| window_config 存储内容 | 空 | CreateWindow options + global_ipc_options |
 
 #### 实际影响场景
 
@@ -270,7 +345,99 @@ alacritty msg create-window     # 窗口 2（追加）→ 有 Beam
 ```
 - 两个窗口的配置不一样！这可能超出用户预期
 
-### 3.4 GetConfig 的返回边界
+### 3.5 重置配置：reset 的行为
+
+`alacritty msg config --reset` 可以清除运行时覆盖。
+
+#### 窗口级 reset（指定 window_id）
+
+调用 `reset_window_config()`（[window_context.rs:343-351](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L343-L351)）：
+
+```rust
+pub fn reset_window_config(&mut self, config: Rc<UiConfig>) {
+    self.message_buffer.remove_target(LOG_TARGET_IPC_CONFIG);  // 清错误提示
+    self.window_config.clear();                                // 清空窗口级覆盖
+    self.update_config(config);                                // 重新应用（用基础配置 + 空 window_config）
+}
+```
+
+→ 效果：该窗口回到**基础配置**状态（不含任何 IPC 覆盖）
+
+#### 全局 reset（window_id=None / -1）
+
+代码（[event.rs:312-317](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L312-L317)）：
+```rust
+if window_id.is_none() {
+    if ipc_config.reset {
+        self.global_ipc_options.clear();  // 清空全局覆盖
+    } else {
+        self.global_ipc_options.append(&mut options);
+    }
+}
+```
+
+加上前面的窗口循环，全局 reset 做了两件事：
+1. 对所有窗口调用 `reset_window_config()` → 清空每个窗口自己的 window_config
+2. 清空 `global_ipc_options` → 后续新建窗口也不会继承全局覆盖
+
+→ 效果：所有窗口回到**基础配置**状态，未来新窗口也从基础配置开始
+
+#### 注意：重置 vs 配置文件重新加载
+
+reset 只清除**运行时 IPC 覆盖**，不会触及：
+- 配置文件中的设置
+- 启动时 CLI 参数的覆盖（已融合进基础 config）
+
+### 3.6 配置文件重新加载：覆盖项会保留吗？
+
+配置文件被修改时，`ConfigMonitor` 检测到变化，触发 `EventType::ConfigReload`（[event.rs:343-370](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L343-L370)）：
+
+```rust
+(EventType::ConfigReload(path), _) => {
+    if let Ok(config) = config::reload(&path, &mut self.cli_options) {
+        self.config = Rc::new(config);                  // ① 更新全局基础配置
+        
+        for window_context in self.windows.values_mut() {
+            window_context.update_config(self.config.clone());  // ② 每个窗口重新应用
+        }
+    }
+}
+```
+
+每个窗口的 `update_config()` 做了什么（[window_context.rs:261-265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L261-L265)）：
+
+```rust
+pub fn update_config(&mut self, new_config: Rc<UiConfig>) {
+    let old_config = mem::replace(&mut self.config, new_config);  // 替换基础配置
+    self.config = self.window_config.override_config_rc(self.config.clone());  // 重新应用窗口级覆盖
+    // ... 后续更新显示、终端等
+}
+```
+
+**结论**：
+
+| 配置层 | ConfigReload 后的行为 | 是否保留 |
+|--------|----------------------|---------|
+| 基础配置（文件） | 重新加载，内容可能变 | 新内容 |
+| 启动时 CLI 覆盖 | `config::reload()` 时重新应用 | ✅ 保留（融合在基础 config 里） |
+| global_ipc_options | ConfigReload 不碰它 | ✅ 完整保留 |
+| 窗口级 window_config | 保留 + 在新基础上重新应用 | ✅ 完整保留 |
+
+→ **配置文件重新加载不会清除任何 IPC 覆盖**，所有运行时设置都保留，只是换了一层"底子"。
+
+→ 但是！由于 `override_config` 有**自动清理无效项**的特性（[cli.rs:385-391](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L385-L391)），如果新配置文件导致某个 IPC 覆盖项变得无效（比如字段被删除了），下次应用时会被自动清掉。
+
+#### global_ipc_options 何时重新应用？
+
+细心的读者可能会问：`global_ipc_options` 在 ConfigReload 中没有被重新应用到窗口上？
+
+答案是：**不需要，也不会。**
+
+因为 `global_ipc_options` 的内容**已经存在每个窗口的 window_config 里了**——当初发全局 IPC Config 消息时，既更新了 global_ipc_options，也调用 add_window_config 追加到了每个窗口的 window_config 里。
+
+所以 ConfigReload 只需要重新应用 window_config 就够了，global_ipc_options 只是一个"模板"，用来给未来新建的窗口做初始化。
+
+### 3.7 GetConfig 的返回边界
 
 `alacritty msg get-config` 返回内容取决于 `--window-id`（[event.rs:322-327](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L322-L327)）：
 
@@ -388,15 +555,24 @@ TerminalEvent::Exit
 - `socket_dir()`: [polling/ipc.rs:154-167](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/polling/ipc.rs#L154-L167)
 - window_id 转换（i128 → Option<WindowId>）: [polling/ipc.rs:77-85](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/polling/ipc.rs#L77-L85)
 
-### 配置覆盖
+### 配置覆盖底层
+- `ParsedOptions` 定义: [cli.rs:356-359](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L356-L359)
+- `override_config()`（顺序应用 + 失败清理）: [cli.rs:381-396](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L381-L396)
+- `override_config_rc()`: [cli.rs:399-410](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/cli.rs#L399-L410)
+
+### 配置覆盖边界
 - `global_ipc_options` 字段: [event.rs:98](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L98)
-- IPC Config 处理: [event.rs:293-318](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L293-L318)
-- 初始窗口创建（无 global 叠加）: [event.rs:151-167](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L151-L167)
-- 追加窗口创建（有 global 叠加）: [event.rs:170-195](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L170-L195)
-- 窗口级覆盖应用（update_config 中）: [window_context.rs:261-265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L261-L265)
-- `add_window_config()`: [window_context.rs:355-363](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L355-L363)
-- `reset_window_config()`: [window_context.rs:343-351](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L343-L351)
+- IPC Config 处理（含全局/窗口级分发）: [event.rs:293-318](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L293-L318)
+- 初始窗口创建（无覆盖）: [event.rs:151-167](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L151-L167)
+- 追加窗口创建（有 global + 本次覆盖）: [event.rs:170-195](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L170-L195)
+- 窗口级覆盖应用入口: [window_context.rs:261-265](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L261-L265)
+- `add_window_config()`（追加 + 重新应用）: [window_context.rs:355-363](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L355-L363)
+- `reset_window_config()`（清空 + 重新应用）: [window_context.rs:343-351](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L343-L351)
 - 追加窗口存入 window_config: [window_context.rs:160-164](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L160-L164)
+
+### 配置文件重新加载
+- ConfigReload 事件处理: [event.rs:343-370](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L343-L370)
+- `update_config()`（替换基础 + 重应用窗口级）: [window_context.rs:261-284](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/window_context.rs#L261-L284)
 
 ### Daemon 与错误隔离
 - 初始窗口创建（正常启动）: [event.rs:238-247](file:///d:/fz/0601/solo-dogfeeding/code/340-alacritty/alacritty/src/event.rs#L238-L247)
