@@ -772,14 +772,65 @@ fn supports_robustness() -> bool {
 }
 ```
 
-> **注意**：如果不支持 `GL_KHR_robustness` 扩展或策略不是 `LOSE_CONTEXT_ON_RESET`，`robustness` 为 `false`，`was_context_reset()` 永远返回 `false`，程序将无法检测 GPU 重置。
-
-**上下文重置检测** [renderer/mod.rs#L281-L302](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/mod.rs#L281-L302)
+**上下文重置检测的两种独立路径** [display/mod.rs#L556-L574](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/display/mod.rs#L556-L574)
 
 ```rust
+pub fn make_current(&mut self) {
+    let is_current = self.context.is_current();
+    
+    let context_loss = if is_current {
+        // 路径 1: 上下文已是 current，通过 GL_KHR_robustness 扩展检测
+        self.renderer.was_context_reset()
+    } else {
+        // 路径 2: 上下文不是 current，通过 glutin 窗口库的 API 返回值检测
+        match self.context.make_current(&self.surface) {
+            Err(err) if err.error_kind() == ErrorKind::ContextLost => {
+                info!("Context lost for window {:?}", self.window.id());
+                true
+            },
+            _ => false,
+        }
+    };
+    
+    if !context_loss {
+        return;  // 没有丢失，正常返回
+    }
+    // ... 执行重建 ...
+}
+```
+
+**两条路径的独立触发条件**：
+
+| 检测路径 | 触发条件 | 是否依赖 `GL_KHR_robustness` 扩展 |
+|---------|---------|-------------------------------|
+| **路径 1：`was_context_reset()`** | GL 上下文已处于 current 状态时，渲染前检测 | **是** — 需支持扩展且策略为 `LOSE_CONTEXT_ON_RESET` |
+| **路径 2：`make_current()` 返回 `ContextLost`** | GL 上下文**未**处于 current 状态时，尝试激活失败 | **否** — 通过 glutin/EGL/GLX 等窗口系统 API 直接返回错误 |
+
+> ⚠️ **关键澄清**：即使不支持 `GL_KHR_robustness` 扩展，路径 2 依然可以在上下文切换时检测到 GPU 重置。只有路径 1（上下文持续保持 current 时的检测）依赖该扩展。
+
+**路径 1 实现**（依赖扩展）[renderer/mod.rs#L281-L321](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/renderer/mod.rs#L281-L321)：
+
+```rust
+fn supports_robustness() -> bool {
+    let mut notification_strategy = 0;
+    if GlExtensions::contains("GL_KHR_robustness") {
+        unsafe {
+            gl::GetIntegerv(gl::RESET_NOTIFICATION_STRATEGY_KHR, &mut notification_strategy);
+        }
+    }
+    
+    if notification_strategy == gl::LOSE_CONTEXT_ON_RESET_KHR as gl::types::GLint {
+        info!("GPU reset notifications are enabled");
+        true
+    } else {
+        info!("GPU reset notifications are disabled");
+        false
+    }
+}
+
 pub fn was_context_reset(&self) -> bool {
     if !self.robustness {
-        return false;  // 不支持健壮性扩展，无法检测
+        return false;  // 不支持健壮性扩展，路径 1 不可用
     }
     
     let status = unsafe { gl::GetGraphicsResetStatus() };
@@ -798,32 +849,9 @@ pub fn was_context_reset(&self) -> bool {
 }
 ```
 
-**两种检测路径** [display/mod.rs#L556-L574](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/display/mod.rs#L556-L574)：
+**路径 2 实现**（不依赖扩展，通过窗口库 API）：
 
-```rust
-pub fn make_current(&mut self) {
-    let is_current = self.context.is_current();
-    
-    let context_loss = if is_current {
-        // 路径 1: 上下文已是 current，通过 robustness 扩展检测
-        self.renderer.was_context_reset()
-    } else {
-        // 路径 2: 上下文不是 current，通过 make_current 的返回值检测
-        match self.context.make_current(&self.surface) {
-            Err(err) if err.error_kind() == ErrorKind::ContextLost => {
-                info!("Context lost for window {:?}", self.window.id());
-                true
-            },
-            _ => false,
-        }
-    };
-    
-    if !context_loss {
-        return;  // 没有丢失，正常返回
-    }
-    // ... 执行重建 ...
-}
-```
+当上下文并非 current 时（例如多窗口切换、渲染暂停后恢复、窗口重新显示等场景），调用 `context.make_current()` 时，窗口库（glutin）会从底层 EGL/GLX/WGL 收到 `EGL_CONTEXT_LOST` 或等价错误，直接包装为 `ErrorKind::ContextLost` 返回。此路径完全不依赖 OpenGL 扩展支持。
 
 **完整重建流程** [display/mod.rs#L576-L604](file:///d:/fz/0601/solo-dogfeeding/code/334-alacritty/alacritty/src/display/mod.rs#L576-L604)：
 
@@ -868,7 +896,8 @@ self.damage_tracker.frame().mark_fully_damaged();
 
 | 边界情况 | 行为 |
 |---------|------|
-| 不支持 `GL_KHR_robustness` | 无法检测 GPU 重置，遇到重置会直接崩溃或渲染异常 |
+| 不支持 `GL_KHR_robustness` | **路径 1 失效**（上下文持续 current 时无法检测）；但**路径 2 依然可用**（上下文切换时通过窗口库 API 检测） |
+| 上下文持续保持 current 且无扩展 | 完全无法检测，可能出现渲染异常或 GL 错误 |
 | 重建 GL context 失败 | `expect("failed to recreate context")` → **panic** |
 | 重建 Renderer 失败 | `expect("failed to recreate renderer after reset")` → **panic** |
 | 重建时的渲染器类型 | 使用原有的 `renderer_preference`，**不降级** |
@@ -876,7 +905,7 @@ self.damage_tracker.frame().mark_fully_damaged();
 | 损伤状态 | 全屏标记为脏，下一帧完整重绘 |
 | 触发时机 | 每次 `make_current()` 时检测，通常在渲染前调用 |
 
-> **关键结论**：GPU 上下文重建是一种"尽力而为"的恢复机制。如果重建失败，程序直接 panic 崩溃。不存在"GLSL3 重建失败就回退到 GLES2"的降级逻辑。
+> **关键结论**：GPU 上下文重建是一种"尽力而为"的恢复机制。拥有两条检测路径：路径 1（`GL_KHR_robustness` 扩展）和路径 2（窗口库 API），两者独立工作。如果重建失败，程序直接 panic 崩溃。不存在"GLSL3 重建失败就回退到 GLES2"的降级逻辑。
 
 #### 字形加载容错机制
 
@@ -1492,17 +1521,26 @@ pub fn make_current(&mut self) {
 
 #### 4.6.2 GPU 重置恢复（尽力而为机制）
 
-当 GPU 上下文丢失（如驱动崩溃、TTDR 等）时，Alacritty 会**尝试**自动恢复，但这是一种"尽力而为"的机制，存在诸多限制：
+当 GPU 上下文丢失（如驱动崩溃、TTDR 等）时，Alacritty 会**尝试**自动恢复，但这是一种"尽力而为"的机制，存在诸多限制。
 
-**恢复流程**（仅在支持 `GL_KHR_robustness` 扩展时可用）：
-1. 检测到 `ContextLost` 或 `GUILTY_CONTEXT_RESET_KHR`
+**两种检测路径**（独立运行，任一命中即可触发恢复）：
+
+| 检测方式 | 适用场景 | 依赖条件 |
+|---------|---------|---------|
+| `was_context_reset()` | 上下文**已是** current（单窗口连续渲染） | 需支持 `GL_KHR_robustness` 扩展且策略为 `LOSE_CONTEXT_ON_RESET` |
+| `make_current()` 返回值 | 上下文**非** current（多窗口切换、首次渲染） | 依赖底层 EGL/GLX/WGL 返回 `ContextLost` 错误码 |
+
+> **关键结论**：健壮性扩展并非触发恢复的唯一途径。多窗口场景下，即使不支持 `GL_KHR_robustness`，切换窗口时 `make_current()` 返回的 `ContextLost` 错误也能触发恢复。
+
+**恢复流程**：
+1. 检测到 GPU 上下文丢失（上述两种方式之一）
 2. 重建 GL 上下文（失败则 panic）
 3. 重建 Renderer（重新编译 shader，使用原渲染器偏好，不降级，失败则 panic）
 4. 重置字形缓存
 5. 标记全屏损伤，触发完整重绘
 
 > ⚠️ **重要限制**：
-> - 不支持 `GL_KHR_robustness` 扩展时，无法检测 GPU 重置
+> - **单窗口 + 无 `GL_KHR_robustness`**：上下文始终 current，`make_current` 分支不执行，**无法检测 GPU 重置**，可能持续渲染异常或崩溃
 > - 重建 GL 上下文或 Renderer 失败时，程序直接 panic 崩溃
 > - 重建时使用原渲染器偏好，不存在"GLSL3 失败回退到 GLES2"的降级逻辑
 
