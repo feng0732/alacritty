@@ -1,6 +1,6 @@
 # Alacritty IME 提交流向与光标互斥深度分析
 
-> 本文档所有源码定位均使用仓库根目录相对路径 + 行号格式，可直接在 GitHub 仓库或 IDE 中 `file:relative/path#Lx-Ly` 跳转复核。
+> 本文档所有源码定位均使用 **Markdown 相对链接**（仓库根目录相对路径 + 行号锚点）。在 GitHub 仓库页面直接点击链接即可跳转到对应代码；本地 IDE 中按配置支持的文件导航方式复核。
 
 ---
 
@@ -8,7 +8,7 @@
 
 ### 1.1 入口：所有 IME Commit 统一走 `paste()`
 
-**定位证据**：`alacritty/src/event.rs#L2018-L2024`
+**定位证据**：[alacritty/src/event.rs#L2018-L2024](alacritty/src/event.rs#L2018-L2024)
 
 ```rust
 WindowEvent::Ime(ime) => match ime {
@@ -24,7 +24,7 @@ WindowEvent::Ime(ime) => match ime {
 
 ### 1.2 `paste()` 的三路分流
 
-**定位证据**：`alacritty/src/event.rs#L1369-L1411`
+**定位证据**：[alacritty/src/event.rs#L1369-L1411](alacritty/src/event.rs#L1369-L1411)
 
 ```
 paste(text, bracketed)
@@ -48,7 +48,7 @@ paste(text, bracketed)
 
 ### 1.3 分支1：搜索模式下的 IME Commit
 
-**定位证据**：`alacritty/src/event.rs#L1370-L1373`
+**定位证据**：[alacritty/src/event.rs#L1370-L1373](alacritty/src/event.rs#L1370-L1373)
 
 ```rust
 if self.search_active() {
@@ -62,13 +62,13 @@ if self.search_active() {
 
 关键细节：
 - IME Commit 可能一次提交多个字符（如词组"你好"），`paste()` 将其逐字符拆分后每个字符调用 `search_input()`
-- `search_input()` 内部对字符做了过滤，只接受可打印字符和退格。定位：`alacritty/src/event.rs#L1078-L1087`
+- `search_input()` 内部对字符做了过滤，只接受可打印字符和退格。见 [alacritty/src/event.rs#L1078-L1087](alacritty/src/event.rs#L1078-L1087)
 - 此时 `bracketed` 参数被忽略——搜索模式不关心 bracketed paste 语义
 - 这是合理的：搜索栏是 Alacritty 自己的 UI，不是终端应用程序，不需要 bracketed paste 协议
 
 ### 1.4 分支2：内联搜索模式下的 IME Commit
 
-**定位证据**：`alacritty/src/event.rs#L1374-L1375`
+**定位证据**：[alacritty/src/event.rs#L1374-L1375](alacritty/src/event.rs#L1374-L1375)
 
 ```rust
 else if self.inline_search_state.char_pending {
@@ -78,7 +78,7 @@ else if self.inline_search_state.char_pending {
 
 完整路径：`Ime::Commit` → `paste()` → `inline_search_input(text)` → 取第一个字符 → `inline_search_next()`
 
-**定位证据**：`alacritty/src/event.rs#L1465-L1478`
+**定位证据**：[alacritty/src/event.rs#L1465-L1478](alacritty/src/event.rs#L1465-L1478)
 
 ```rust
 fn inline_search_input(&mut self, text: &str) {
@@ -105,7 +105,7 @@ fn inline_search_input(&mut self, text: &str) {
 
 ### 1.5 分支3+4：普通终端模式下的 IME Commit
 
-**定位证据**：`alacritty/src/event.rs#L1376-L1410`
+**定位证据**：[alacritty/src/event.rs#L1376-L1410](alacritty/src/event.rs#L1376-L1410)
 
 ```rust
 else if bracketed && self.terminal().mode().contains(TermMode::BRACKETED_PASTE) {
@@ -115,7 +115,7 @@ else if bracketed && self.terminal().mode().contains(TermMode::BRACKETED_PASTE) 
 }
 ```
 
-IME Commit 传入的 `bracketed` 参数是 `text.chars().count() > 1`（见入口 `alacritty/src/event.rs#L2022`）：
+IME Commit 传入的 `bracketed` 参数是 `text.chars().count() > 1`（见入口 [alacritty/src/event.rs#L2022](alacritty/src/event.rs#L2022)）：
 
 | IME 提交 | 字符数 | bracketed | 实际行为 |
 |----------|--------|-----------|---------|
@@ -135,7 +135,7 @@ IME Commit 传入的 `bracketed` 参数是 `text.chars().count() > 1`（见入�
 
 ### 2.1 路径A：终端主光标的隐藏
 
-**定位证据**：`alacritty/src/display/content.rs#L52-L62`
+**定位证据**：[alacritty/src/display/content.rs#L52-L62](alacritty/src/display/content.rs#L52-L62)
 
 ```rust
 // Find terminal cursor shape.
@@ -163,7 +163,7 @@ let cursor_shape = if terminal_content.cursor.shape == CursorShape::Hidden
 
 当 `cursor_shape` 被设为 `CursorShape::Hidden` 后，`RenderableCursor::rects()` 中：
 
-**定位证据**：`alacritty/src/display/cursor.rs#L29-L34`
+**定位证据**：[alacritty/src/display/cursor.rs#L29-L34](alacritty/src/display/cursor.rs#L29-L34)
 
 ```rust
 match self.shape() {
@@ -178,7 +178,7 @@ match self.shape() {
 
 ### 2.2 路径B：搜索栏光标的隐藏
 
-**定位证据**：`alacritty/src/display/mod.rs#L929-L937`
+**定位证据**：[alacritty/src/display/mod.rs#L929-L937](alacritty/src/display/mod.rs#L929-L937)
 
 ```rust
 // Add cursor to search bar if IME is not active.
@@ -196,16 +196,17 @@ if self.ime.preedit().is_none() {
 
 ### 2.3 Preedit 光标替代终端光标的完整替换链
 
-当 IME preedit 活跃时，终端光标被隐藏，取而代之的是 IME 自身的光标。整个替换链如下：
+当 IME preedit 活跃时，终端光标被隐藏，取而代之的是 IME 自身的光标。整个替换链如下（对应完整路径见各定位证据链接）：
 
 ```
 Preedit 活跃
   │
-  ├─ 终端主光标: content.rs#L55 → CursorShape::Hidden → cursor.rs#L33 → 空 Rects
+  ├─ 终端主光标: content.rs 第55行 → CursorShape::Hidden
+  │                           → cursor.rs 第33行 → 空 Rects（不渲染）
   │
-  ├─ 搜索栏光标: mod.rs#L930 → 跳过 Underline 光标创建
+  ├─ 搜索栏光标: display/mod.rs 第930行 → 条件不成立 → 跳过 Underline 光标创建
   │
-  └─ IME 替代光标: draw_ime_preview() L1193-L1209
+  └─ IME 替代光标: draw_ime_preview() 第1193-1209行
        ├─ 多字符选中 → CursorShape::HollowBlock
        ├─ 单字符/无选中 → CursorShape::Beam
        └─ 渲染到 preedit 文本所在位置
@@ -213,7 +214,7 @@ Preedit 活跃
 
 ### 2.4 IME 替代光标的渲染逻辑
 
-**定位证据**：`alacritty/src/display/mod.rs#L1193-L1213`
+**定位证据**：[alacritty/src/display/mod.rs#L1193-L1213](alacritty/src/display/mod.rs#L1193-L1213)
 
 ```rust
 let ime_popup_point = match preedit.cursor_end_offset {
@@ -239,7 +240,7 @@ let ime_popup_point = match preedit.cursor_end_offset {
 };
 ```
 
-光标位置计算的数值含义（以 `mod.rs#L1204-L1207` 为例）：
+光标位置计算的数值含义（见 [alacritty/src/display/mod.rs#L1204-L1207](alacritty/src/display/mod.rs#L1204-L1207)）：
 
 - `end` 是可见预编辑文本的末尾列号
 - `cursor_end_offset.0` 是从预编辑文本末尾到光标起始位置的字符宽度距离
@@ -256,7 +257,7 @@ let ime_popup_point = match preedit.cursor_end_offset {
 
 | 特性 | 终端主光标 | 搜索栏光标 |
 |------|-----------|-----------|
-| 代码位置 | `alacritty/src/display/content.rs#L52-L62` | `alacritty/src/display/mod.rs#L929-L937` |
+| 代码位置 | [alacritty/src/display/content.rs#L52-L62](alacritty/src/display/content.rs#L52-L62) | [alacritty/src/display/mod.rs#L929-L937](alacritty/src/display/mod.rs#L929-L937) |
 | 隐藏时机 | RenderableContent 构造时 | draw() 渲染时 |
 | 隐藏方式 | shape 强制为 Hidden，rects 产生空迭代 | 不创建 RenderableCursor |
 | 影响范围 | 同时隐藏了 Block/Beam/Underline/HollowBlock 所有形状 | 只影响 Underline 搜索栏光标 |
@@ -328,7 +329,7 @@ T4  Ime::Commit("X")                           OFF        启用
 T5  IME 被禁用                                 ON         禁用
 ```
 
-**关键时序 T2** 的定位证据：`alacritty/src/input/keyboard.rs#L31-L34`
+**关键时序 T2** 的定位证据：[alacritty/src/input/keyboard.rs#L31-L34](alacritty/src/input/keyboard.rs#L31-L34)
 
 ```rust
 if key.state == ElementState::Released {
@@ -340,9 +341,9 @@ if key.state == ElementState::Released {
 }
 ```
 
-这确保了内联搜索等待字符输入时 IME 被启用，用户可以用 IME 输入搜索字符。一旦字符被接收，IME 立即被重新禁用（见 `inline_search_input()` 的 `alacritty/src/event.rs#L1474`）。
+这确保了内联搜索等待字符输入时 IME 被启用，用户可以用 IME 输入搜索字符。一旦字符被接收，IME 立即被重新禁用（见 `inline_search_input()` 中的 [alacritty/src/event.rs#L1474](alacritty/src/event.rs#L1474)）。
 
-同时，`alacritty/src/input/keyboard.rs#L23-L26` 的键盘互斥：
+同时，[alacritty/src/input/keyboard.rs#L23-L26](alacritty/src/input/keyboard.rs#L23-L26) 的键盘互斥：
 
 ```rust
 // IME input will be applied on commit and shouldn't trigger key bindings.
@@ -355,20 +356,20 @@ preedit 活跃期间所有按键直接返回，防止 IME 组合过程中的按�
 
 ---
 
-## 6. 源码定位速查表（仓库相对路径 + 行号）
+## 6. 源码定位速查表（仓库相对路径 + 行号链接）
 
-| 分析点 | 相对路径 + 行号 | 功能 |
-|--------|-----------------|------|
-| IME Commit 入口 | `alacritty/src/event.rs#L2018-L2024` | winit Ime::Commit → paste() |
-| paste() 三路分流 | `alacritty/src/event.rs#L1369-L1411` | 搜索/内联搜索/终端三路 |
-| search_input 调用点 | `alacritty/src/event.rs#L1370-L1373` | 搜索模式逐字符接收 IME 提交 |
-| inline_search_input | `alacritty/src/event.rs#L1374-L1375` | 内联搜索调用入口 |
-| inline_search_input 实现 | `alacritty/src/event.rs#L1465-L1478` | 取首字符 + 重新禁用 VI IME |
-| bracketed paste 路径 | `alacritty/src/event.rs#L1376-L1389` | 多字符 IME 走 bracketed paste |
-| 普通 paste 路径 | `alacritty/src/event.rs#L1390-L1410` | 单字符或非 bracketed 模式 |
-| 终端光标 preedit 隐藏 | `alacritty/src/display/content.rs#L52-L62` | CursorShape::Hidden 判定 |
-| Hidden 形状产生空 Rects | `alacritty/src/display/cursor.rs#L29-L34` | match 分支 _ → CursorRects::default() |
-| 搜索栏光标 preedit 隐藏 | `alacritty/src/display/mod.rs#L929-L937` | preedit 时不创建 Underline 光标 |
-| IME 替代光标渲染 | `alacritty/src/display/mod.rs#L1193-L1213` | Beam / HollowBlock 与列计算 |
-| 键盘 preedit 互斥 | `alacritty/src/input/keyboard.rs#L23-L26` | preedit 活跃时跳过按键处理 |
-| 内联搜索 key release 启用 IME | `alacritty/src/input/keyboard.rs#L31-L34` | key release 清除 VI 抑制器 |
+| 分析点 | 相对链接 | 功能 |
+|--------|---------|------|
+| IME Commit 入口 | [alacritty/src/event.rs#L2018-L2024](alacritty/src/event.rs#L2018-L2024) | winit Ime::Commit → paste() |
+| paste() 三路分流 | [alacritty/src/event.rs#L1369-L1411](alacritty/src/event.rs#L1369-L1411) | 搜索/内联搜索/终端三路 |
+| search_input 调用点 | [alacritty/src/event.rs#L1370-L1373](alacritty/src/event.rs#L1370-L1373) | 搜索模式逐字符接收 IME 提交 |
+| inline_search_input | [alacritty/src/event.rs#L1374-L1375](alacritty/src/event.rs#L1374-L1375) | 内联搜索调用入口 |
+| inline_search_input 实现 | [alacritty/src/event.rs#L1465-L1478](alacritty/src/event.rs#L1465-L1478) | 取首字符 + 重新禁用 VI IME |
+| bracketed paste 路径 | [alacritty/src/event.rs#L1376-L1389](alacritty/src/event.rs#L1376-L1389) | 多字符 IME 走 bracketed paste |
+| 普通 paste 路径 | [alacritty/src/event.rs#L1390-L1410](alacritty/src/event.rs#L1390-L1410) | 单字符或非 bracketed 模式 |
+| 终端光标 preedit 隐藏 | [alacritty/src/display/content.rs#L52-L62](alacritty/src/display/content.rs#L52-L62) | CursorShape::Hidden 判定 |
+| Hidden 形状产生空 Rects | [alacritty/src/display/cursor.rs#L29-L34](alacritty/src/display/cursor.rs#L29-L34) | match 分支 _ → CursorRects::default() |
+| 搜索栏光标 preedit 隐藏 | [alacritty/src/display/mod.rs#L929-L937](alacritty/src/display/mod.rs#L929-L937) | preedit 时不创建 Underline 光标 |
+| IME 替代光标渲染 | [alacritty/src/display/mod.rs#L1193-L1213](alacritty/src/display/mod.rs#L1193-L1213) | Beam / HollowBlock 与列计算 |
+| 键盘 preedit 互斥 | [alacritty/src/input/keyboard.rs#L23-L26](alacritty/src/input/keyboard.rs#L23-L26) | preedit 活跃时跳过按键处理 |
+| 内联搜索 key release 启用 IME | [alacritty/src/input/keyboard.rs#L31-L34](alacritty/src/input/keyboard.rs#L31-L34) | key release 清除 VI 抑制器 |
