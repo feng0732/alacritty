@@ -210,19 +210,47 @@ pub(crate) const MAX_PARAMS: usize = 32;
 `Params` 内部使用固定大小数组 `[u16; 32]`。当参数或子参数总数超过 32 时：
 
 1. `Params::is_full()` 返回 `true`
-2. `action_param` / `action_subparam` / `action_paramnext` 设置 `self.ignoring = true`
-3. `action_csi_dispatch` 在回调前也检查 `is_full`：
+2. 所有与参数相关的 action 都会设置 `self.ignoring = true`：
+   - **`action_csi_dispatch`**：最终 dispatch 时，若仍有未 push 的最后一个参数且 is_full
+   - **`action_hook`**：DCS hook 时
+   - **`action_collect`**：中间字节满时（见 §2.5）
+   - **`action_subparam`**：收到冒号 `:` 时
+   - **`action_param`**：收到分号 `;` 时
+   - **`action_paramnext`**：收到数字字节时
+
+3. `action_csi_dispatch` 的完整逻辑：
    ```rust
-   fn action_csi_dispatch(&mut self, performer, byte) {
+   fn action_csi_dispatch(&mut self, performer: &mut P, byte: u8) {
        if self.params.is_full() {
-           self.ignoring = true;
+           self.ignoring = true;     // 参数总数超限，标记忽略
        } else {
-           self.params.push(self.param);
+           self.params.push(self.param);  // 推入最后一个未完成参数
        }
-       performer.csi_dispatch(self.params(), self.intermediates(), self.ignoring, byte as char);
+       performer.csi_dispatch(
+           self.params(),
+           self.intermediates(),
+           self.ignoring,   // ← 以 Perform trait 的 `_ignore` 参数名传递
+           byte as char,
+       );
+       self.state = State::Ground
    }
    ```
-4. Performer 的 `csi_dispatch` 收到 `has_ignored_intermediates = true`，但**仍然回调 Handler**——只是 Handler 可以选择忽略
+
+4. **Performer 层面直接丢弃**：在 `impl Perform for Performer` 的 `csi_dispatch` 中，该参数被重命名为 `has_ignored_intermediates`，并作为第一道守卫：
+   ```rust
+   fn csi_dispatch(
+       &mut self, params: &Params, intermediates: &[u8],
+       has_ignored_intermediates: bool, action: char,
+   ) {
+       if has_ignored_intermediates || intermediates.len() > 2 {
+           unhandled!();   // debug 日志
+           return;         // ← 直接返回，不进入具体指令匹配
+       }
+       // 下面才是具体的 ('H', [])、('m', []) 等 match
+   }
+   ```
+
+所以**参数超限的序列根本不会到达 Handler**，它在 Performer 的 `csi_dispatch` 入口就被拦截了。之前文档说"仍然回调 Handler"是错误的——`has_ignored_intermediates` 直接触发 `unhandled!()` + `return`，不会往下走。
 
 ### 2.4 子参数（Subparameter）的处理
 
@@ -249,6 +277,103 @@ fn action_subparam(&mut self) {
 - `ParamsIter` 返回单个切片 `&[38, 2, 255, 0, 128]`
 
 在 `next_param_or` 中，`Some(&[38, ..]) if 38 != 0` 匹配成功，取 `38`。后续子参数（2、255、0、128）需要通过 `params_iter.next()` 返回的完整切片来访问。
+
+### 2.5 中间字节（Intermediate）的超限与忽略机制
+
+中间字节是指 ESC 或 CSI 之后出现在参数之前（或参数之后）的 `0x20–0x2F` 范围内的字节（如空格、`?`、`>`、`!`、`$` 等）。
+
+#### 常量与存储
+
+```rust
+// vte/src/lib.rs
+const MAX_INTERMEDIATES: usize = 2;
+
+pub struct Parser {
+    intermediates: [u8; MAX_INTERMEDIATES], // [u8; 2]
+    intermediate_idx: usize,
+    // ...
+}
+```
+
+Parser 内部用固定 2 字节数组存储中间字节，通过 `intermediate_idx` 跟踪数量。
+
+#### action_collect：中间字节累积
+
+```rust
+// vte/src/lib.rs
+fn action_collect(&mut self, byte: u8) {
+    if self.intermediate_idx == MAX_INTERMEDIATES {
+        self.ignoring = true;     // ← 第三个及之后的中间字节触发忽略
+    } else {
+        self.intermediates[self.intermediate_idx] = byte;
+        self.intermediate_idx += 1;
+    }
+}
+```
+
+`action_collect` 在以下状态收到 `0x20–0x2F` 字节时被调用：
+- `EscapeIntermediate`
+- `CsiIntermediate`
+- `DcsIntermediate`
+- `CsiParam`（收到 `0x20–0x2F` 时先 `action_collect`，再转入 `CsiIntermediate`）
+- `DcsParam`（收到 `0x20–0x2F` 时先 `action_collect`，再转入 `DcsIntermediate`）
+
+#### CsiIgnore 状态：参数/中间字节非法后的静默吞掉
+
+如果中间字节超限后，在 `CsiIntermediate` 状态下又收到参数字节（`0x30–0x3F`），Parser 转入 `CsiIgnore` 状态：
+
+```rust
+// vte/src/lib.rs
+fn advance_csi_intermediate(&mut self, performer, byte: u8) {
+    match byte {
+        0x20..=0x2F => self.action_collect(byte),
+        0x30..=0x3F => self.state = State::CsiIgnore,  // ← 参数出现在中间字节之后→忽略
+        0x40..=0x7E => self.action_csi_dispatch(performer, byte),
+        // ...
+    }
+}
+```
+
+同理，`CsiParam` 状态下收到 `0x3C–0x3F`（`< = > ?` 中除了 `0x3A = ':'` 和 `0x3B = ';'` 之外的 4 个字节）也会转入 `CsiIgnore`：
+
+```rust
+fn advance_csi_param(&mut self, performer, byte: u8) {
+    match byte {
+        0x30..=0x39 => self.action_paramnext(byte),
+        0x3A       => self.action_subparam(),
+        0x3B       => self.action_param(),
+        0x3C..=0x3F => self.state = State::CsiIgnore,  // ← < = > ? 出现在参数位置
+        0x40..=0x7E => self.action_csi_dispatch(performer, byte),
+        // ...
+    }
+}
+```
+
+#### CsiIgnore 态的处理
+
+```rust
+// vte/src/lib.rs
+fn advance_csi_ignore(&mut self, performer, byte: u8) {
+    match byte {
+        0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte), // C0 控制仍执行
+        0x20..=0x3F => (),       // 参数/中间字节静默丢弃
+        0x40..=0x7E => self.state = State::Ground, // 终结字节：回 Ground，**不 dispatch**
+        0x7F => (),              // DEL 忽略
+        _ => self.anywhere(performer, byte),        // CAN/SUB/ESC 等全局处理
+    }
+}
+```
+
+**关键差异**：在 `CsiParam` / `CsiIntermediate` 态下，`0x40–0x7E` 会触发 `action_csi_dispatch`（调用 `performer.csi_dispatch`），但在 `CsiIgnore` 态下**只回 Ground、不 dispatch**——整个 CSI 序列被彻底丢弃。
+
+所以中间字节超限有两条丢弃路径：
+
+| 路径 | 触发条件 | 丢弃位置 |
+|------|---------|---------|
+| 1 | 中间字节 ≥ 3 个（`action_collect` 设 `ignoring=true`），最终走到 `0x40–0x7E` | Performer.csi_dispatch 入口：`if has_ignored_intermediates { return; }` |
+| 2 | `CsiIntermediate` 收到 `0x30–0x3F` 或 `CsiParam` 收到 `0x3C–0x3F` → `CsiIgnore` | `advance_csi_ignore` 中对 `0x40–0x7E` 只回 Ground，**完全不调用** `csi_dispatch` |
+
+DCS 序列（`DcsIntermediate` / `DcsParam` / `DcsIgnore`）遵循完全相同的逻辑。
 
 ---
 
@@ -322,23 +447,58 @@ fn advance_sync<H>(&mut self, handler: &mut H, bytes: &[u8]) -> usize {
 **ESU 到达**（`CSI ?2026l`）在缓冲中被检测到：
 
 ```rust
-fn advance_sync_csi<H>(&mut self, handler: &mut H, new_bytes: usize) {
-    // 在缓冲区的特定窗口内搜索 0x1B
+// vte/src/ansi.rs:389
+const SYNC_ESCAPE_LEN: usize = 8;
+const BSU_CSI: [u8; SYNC_ESCAPE_LEN] = *b"\x1b[?2026h";
+const ESU_CSI: [u8; SYNC_ESCAPE_LEN] = *b"\x1b[?2026l";
+
+fn advance_sync_csi<H>(&mut self, handler: &mut H, new_bytes: usize)
+where
+    H: Handler,
+{
+    // 精确计算搜索窗口，处理跨 chunk 的转义序列
+    let buffer_len = self.state.sync_state.buffer.len();
+
+    // start_offset：向前回退 7 字节，覆盖"上一批末尾 + 新字节开头"跨边界的情况
+    let start_offset = (buffer_len - new_bytes).saturating_sub(SYNC_ESCAPE_LEN - 1);
+
+    // end_offset：最后一个可以容纳完整 8 字节转义序列的起始位置
+    let end_offset = buffer_len.saturating_sub(SYNC_ESCAPE_LEN - 1);
+
     let search_buffer = &self.state.sync_state.buffer[start_offset..end_offset];
+
+    // 从后向前搜索 0x1B（ESC）
     let mut bsu_offset = None;
     for index in memchr::memchr_iter(0x1B, search_buffer).rev() {
         let offset = start_offset + index;
         let escape = &self.state.sync_state.buffer[offset..offset + SYNC_ESCAPE_LEN];
-        if escape == BSU_CSI {  // \x1b[?2026h → 刷新超时
+
+        if escape == BSU_CSI {
             self.state.sync_state.timeout.set_timeout(SYNC_UPDATE_TIMEOUT);
             bsu_offset = Some(offset);
-        } else if escape == ESU_CSI {  // \x1b[?2026l → 终止同步更新
+        } else if escape == ESU_CSI {
             self.stop_sync_internal(handler, bsu_offset);
             break;
         }
     }
 }
 ```
+
+**精确匹配边界的设计意图**：
+
+- **`start_offset`** = `(buffer_len - new_bytes).saturating_sub(7)`
+  - `buffer_len - new_bytes` 是新字节写入前的长度，即新字节的起始位置
+  - 向前回退 7 字节（`SYNC_ESCAPE_LEN - 1`），确保能检测到**跨批次边界**的 BSU/ESU
+  - 例如：上一批结尾有 3 字节 `\x1b[?`，本批开头 5 字节 `2026h`，合起来就是完整的 BSU
+  - `saturating_sub` 保证不会下溢到负数
+
+- **`end_offset`** = `buffer_len.saturating_sub(7)`
+  - 从缓冲区末尾回退 7 字节，保证搜索到的每个 ESC 后面都有至少 7 字节可以凑成完整的 8 字节转义序列
+  - 换句话说：搜索 `ESC in buffer[start_offset .. end_offset]`，对每个匹配的 ESC 执行 `buffer[offset .. offset+8]` 比较是安全的，不会越界
+
+- **搜索策略**：`memchr_iter(0x1B, search_buffer).rev()` — 从后向前找 ESC
+  - 因为 BSU 和 ESU 都是 8 字节固定序列，找到 ESC 后检查后 7 字节即可
+  - 从后向前可以先找到最近（末尾）的 ESU/BSU，更符合实际时序
 
 **`stop_sync_internal` 的处理**：
 
@@ -476,11 +636,12 @@ if state.parser.sync_bytes_count() < processed && processed > 0 {
 
 只有在同步更新期间处理的非同步字节数超过同步缓冲字节数时，才会发送 Wakeup。由于同步更新期间所有字节都进入缓冲、不被处理（`sync_bytes_count` 持续增长），Wakeup 通常不会发出，直到 `stop_sync` 清空缓冲。
 
-### 3.6 三层兜底总结
+### 3.6 四层兜底总结
 
 | 兜底层 | 触发条件 | 代码位置 | 行为 |
 |--------|---------|---------|------|
-| ESU 正常终止 | 缓冲中检测到 `\x1b[?2026l` | `advance_sync_csi` | 回放缓冲、退出同步模式 |
-| 缓冲溢出 | `buffer.len() + bytes.len() >= 2MiB` | `advance_sync` | 强制 `stop_sync_internal(None)` |
+| ESU 正常终止 | 精确匹配 `\x1b[?2026l`（8 字节） | `advance_sync_csi` | 回放缓冲、退出同步模式 |
+| 精确匹配边界 | 搜索窗口 `[start_offset, end_offset)`，`memchr` 从后向前搜 ESC | `advance_sync_csi` | start_offset 回退 7 字节覆盖跨 chunk，end_offset 回退 7 字节保证不越界 |
+| 缓冲溢出 | `buffer.len() + bytes.len() >= 2MiB` | `advance_sync` | 强制 `stop_sync_internal(None)`，当前批次走正常解析 |
 | 超时到期 | 150ms 内无新 I/O 事件 | EventLoop poll 超时 | `stop_sync()` + Wakeup |
-| 嵌套 BSU | 缓冲中检测到新 `\x1b[?2026h` | `advance_sync_csi` | 刷新超时、保留 BSU 后数据 |
+| 嵌套 BSU | 精确匹配 `\x1b[?2026h`（8 字节） | `advance_sync_csi` | 刷新超时、保留 BSU 后数据继续缓冲 |
