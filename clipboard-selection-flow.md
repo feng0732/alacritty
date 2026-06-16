@@ -253,15 +253,33 @@ pub fn rotate<D: Dimensions>(mut self, ...) -> Option<Selection> {
 | Clear Saved（历史） | 整体丢弃 | 丢弃 | 保留 | `filter(!intersects)` |
 | 向上/向下滚动 | 裁剪跟随 | 裁剪 | 跟随 | `rotate()` |
 | 行数变化 | 裁剪跟随 | 裁剪 | 跟随 | `rotate()` |
+| insert_blank / delete_chars / erase_chars | **不触碰** | - | - | 无选区代码 |
 
-### 3.7 不清除选区的操作
+### 3.7 行内编辑操作：完全不触碰选区状态
 
-以下行内编辑操作**不会**触发选区清除：
-- `insert_blank()` — 插入空白字符
-- `delete_chars()` — 删除字符
-- `erase_chars()` — 擦除字符
+以下三个行内编辑函数**不包含任何选区相关代码**，选区状态不受影响：
 
-这些操作只修改行内单元格内容，但不清除选区。这是因为它们只改变列内容，不改变行结构，而行级相交检查不会命中。
+| 函数 | 代码位置 | 功能 | 选区代码 |
+|------|----------|------|----------|
+| `insert_blank(count)` | [term/mod.rs#L1187-L1212](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1187-L1212) | 在光标处插入空白，右侧单元格右移 | 无 |
+| `delete_chars(count)` | [term/mod.rs#L1538-L1564](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1538-L1564) | 删除光标处字符，右侧单元格左移 | 无 |
+| `erase_chars(count)` | [term/mod.rs#L1519-L1535](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1519-L1535) | 擦除光标处的字符，单元格清空但位置不变 | 无 |
+
+**关键区分**：不是「做了相交判断但未命中」，而是**根本没有做任何选区检查**。
+
+对比 `clear_line()`：[term/mod.rs#L1635-L1658](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1635-L1658)
+```rust
+fn clear_line(&mut self, mode: ansi::LineClearMode) {
+    // ... 清除单元格 ...
+    let range = self.grid.cursor.point.line..=self.grid.cursor.point.line;
+    self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+    //  ↑ clear_line 有显式的选区相交检查
+}
+```
+
+而 `insert_blank` / `delete_chars` / `erase_chars` 的函数体中，**完全没有 `self.selection` 的任何读写**。它们只操作 `self.grid` 中的单元格数据和 `self.damage` 中的损伤标记，选区状态完全不被触及。
+
+**影响**：当光标在选区内执行这些行内编辑操作时，选区坐标不会更新，可能导致选区高亮与实际内容错位。这是代码中的已知行为，与 `clear_line` 的处理策略不一致。
 
 ---
 
