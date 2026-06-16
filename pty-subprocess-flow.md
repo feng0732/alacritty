@@ -221,7 +221,21 @@ pub struct Pty {
 **Windows 平台的特殊复杂度**：
 - 多了一层 `blocking.rs` 来将同步的管道包装为"异步"（实际是后台线程 + pipe 缓冲）
 - 多了 `child.rs` 封装进程退出等待
-- ConPTY 有 deadlock 风险：必须先 drop conout 再 drop backend（通过字段顺序保证）
+- ConPTY 有 deadlock 风险：**必须先 drop backend 再 drop conout**（通过字段顺序保证）
+
+> **重要纠正**：[windows/mod.rs#L28-L30](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/mod.rs#L28-L30) 的注释明确指出：
+> "Backend is required to be the first field, to ensure correct drop order. Dropping `conout` before `backend` will cause a deadlock (with Conpty)."
+>
+> Rust 的 drop 顺序是**按字段声明顺序依次 drop**（先声明的先被 drop），所以：
+> ```
+> Pty {
+>     backend: Backend,      // ← 第1字段，先 drop → ClosePseudoConsole
+>     conout: ReadPipe,      // ← 第2字段，后 drop → 关闭管道
+>     conin: WritePipe,      // ← 第3字段
+>     child_watcher: ...,    // ← 第4字段
+> }
+> ```
+> 原因：`ClosePseudoConsole()` [conpty.rs#L99-L103](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/conpty.rs#L99-L103) 会阻塞等待 conout 管道中的数据被排空。如果先 drop conout，那么 ClosePseudoConsole 将永远等待一个已关闭的管道 → **死锁**。
 
 ---
 
@@ -368,30 +382,58 @@ PTY reader 线程
 
 ## 四、完整数据流转图（含跨平台）
 
-### 4.1 子进程 → 终端 → 渲染 完整链路
+### 4.1 读取方向链路（子进程输出 → 终端 → 渲染）
+
+**重要说明：** Unix 和 Windows 的数据流架构模型完全不同，**不能套用 Unix 的 master/slave 模型到 Windows**。
+
+**管道创建核准**（[conpty.rs#L118-L130](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/conpty.rs#L118-L130)）：
+```rust
+// 管道1：ConPTY 输出 → Alacritty 读取
+let (conout, conout_pty_handle) = miow::pipe::anonymous(0)?;
+//       ↑读端(我们持有)  ↑写端(传给 HPCON)
+
+// 管道2：Alacritty 写入 → ConPTY 输入
+let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
+//       ↑读端(传给 HPCON)  ↑写端(我们持有)
+
+// CreatePseudoConsole(hInput, hOutput, ...)
+(api.create)(size, conin_pty_handle, conout_pty_handle, 0, &mut pty_handle);
+```
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        子进程 (Shell)                           │
-└─────────────────────────────┬────────────────────────────────────┘
-                              │ 写入 stdout/stderr
-┌─────────────────────────────▼────────────────────────────────────┐
-│                     PTY slave 端 (内核)                          │
-└─────────────────────────────┬────────────────────────────────────┘
-                              │
-            ┌─────────────────┴─────────────────┐
-            │                                   │
-┌───────────▼─────────────┐       ┌─────────────▼───────────────┐
-│  Unix: master File      │       │  Windows: conout 管道        │
-│  (O_NONBLOCK)           │       │  (UnblockedReader 包装)      │
-└───────────┬─────────────┘       └─────────────┬───────────────┘
-            │                                   │
-            └─────────────────┬─────────────────┘
-                              │
-                 ┌────────────▼────────────┐
-                 │  EventedReadWrite trait │
-                 │  (平台无关抽象)          │
-                 └────────────┬────────────┘
+                       ┌─────────────────────────┐
+                       │     子进程 (Shell)      │
+                       └────────────┬────────────┘
+                                    │
+         ┌──────────────────────────┐
+         │                          │
+         ▼                          ▼
+┌────────────────────────┐  ┌─────────────────────────────────────────────┐
+│     Unix 模型          │  │        Windows ConPTY 模型                  │
+│  (内核伪终端对 模式)    │  │  (HPCON 星型枢纽 + 两对独立匿名管道)       │
+│                        │  │                                             │
+│ 子进程 stdout/stderr   │  │  子进程通过 PROC_THREAD_ATTRIBUTE           │
+│     ↓ 直接绑定 slave fd │  │  _PSEUDOCONSOLE 绑定到 HPCON               │
+│ PTY slave (内核 tty 层) │  │     ↓ (控制台 I/O 由 ConPTY 内核层处理)     │
+│     ↓ 内核行规程处理    │  │                                             │
+│ PTY master File        │  │  HPCON (ConPTY 内核)                       │
+│ (Alacritty 持有)       │  │     ↓ 写入 hOutput                          │
+│     ↓ read()           │  │  conout_pty_handle (管道1写端)              │
+│ EventedReadWrite::     │  │     ↓ 内核管道传输                          │
+│ reader()               │  │  conout (AnonRead 管道1读端)                │
+│                        │  │     ↓ UnblockedReader::new()                │
+└──────────┬─────────────┘  │     ├─ 后台线程: loop { 阻塞读 conout }     │
+           │                │     │   读到数据 → piper pipe 写端           │
+           │                │     └─ Alacritty 端: piper pipe 读端         │
+           │                │        (注册到 polling，产生可读事件)        │
+           │                │        → EventedReadWrite::reader()         │
+           │                └──────────────────┬──────────────────────────┘
+           └───────────────────────┬───────────┘
+                                   │
+                      ┌────────────▼────────────┐
+                      │ EventedReadWrite trait  │
+                      │    (平台无关抽象)        │
+                      └────────────┬────────────┘
                               │
 ┌─────────────────────────────▼────────────────────────────────────┐
 │                PTY reader 线程 (事件循环)                         │
@@ -408,8 +450,9 @@ PTY reader 线程
 │      │                └── ...                                    │
 │      │                                                           │
 │      └── PTY_CHILD_EVENT_TOKEN → next_child_event()              │
-│           ├── Unix: 读信号管道 → try_wait()                      │
-│           └── Windows: mpsc 接收 → ChildExitWatcher              │
+│           ├── Unix: 读 UnixStream 信号管道 → child.try_wait()       │
+│           └── Windows: mpsc::Receiver::try_recv()                    │
+│                (ChildExitWatcher 回调通过 IOCP post)                          │
 │                                                                  │
 │  → 发送 Event::Wakeup 通知主线程重绘                              │
 └─────────────────────────────┬────────────────────────────────────┘
@@ -437,7 +480,7 @@ PTY reader 线程
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 写入方向链路（键盘 → 子进程）
+### 4.2 写入方向链路（键盘 → 子进程输入）
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -457,24 +500,103 @@ PTY reader 线程
 │      │                                                           │
 │      ├── drain_recv_channel() → 写入 write_list 队列            │
 │      ├── 注册 writable 兴趣                                      │
-│      └── pty_write() → 写入 PTY master / conin                   │
+│      └── pty_write() → EventedReadWrite::writer().write()       │
 │                                                                  │
 └─────────────────────────────┬────────────────────────────────────┘
                               │
             ┌─────────────────┴─────────────────┐
             │                                   │
-┌───────────▼─────────────┐       ┌─────────────▼───────────────┐
-│  Unix: master File      │       │  Windows: conin 管道         │
-│  (直接 write)           │       │  (UnblockedWriter → 后台线程)│
-└───────────┬─────────────┘       └─────────────┬───────────────┘
-            │                                   │
-            └─────────────────┬─────────────────┘
-                              │
-                     PTY slave 端 (内核)
-                              │
-                              ▼
-                        子进程 stdin
+┌───────────▼───────────────────┐  ┌────────────▼─────────────────────────────┐
+│        Unix 写入路径           │  │           Windows 写入路径                │
+│                               │  │                                          │
+│ PTY master File.write()      │  │ UnblockedWriter (Alacritty 端)           │
+│      ↓ 写入 master fd         │  │      ↓ 写入                             │
+│ 内核 PTY 层                   │  │ piper pipe 缓冲                          │
+│      ↓ 行规程处理             │  │      ↓ (后台线程阻塞取数据)              │
+│ PTY slave                    │  │ AnonWrite (管道2写端 conin)               │
+│      ↓                        │  │      ↓ 内核管道传输                      │
+│ 子进程 stdin                  │  │ conin_pty_handle (管道2读端，传给 HPCON)  │
+│                               │  │      ↓ 作为 HPCON 的 hInput               │
+└───────────────────┬───────────┘  │ HPCON (ConPTY 内核)                      │
+                    │              │      ↓ 翻译控制台输入                    │
+                    └──────┬───────┘      │ 传递到子进程                      │
+                           │              └───────────────┬───────────────────┘
+                           │                              │
+                           ▼                              ▼
+                        子进程获得输入数据
 ```
+
+### 4.3 跨平台退出与释放链路对比
+
+#### 4.3.1 子进程退出通知链路（8 个阶段）
+
+| 阶段 | Unix 退出流程 | Windows 退出流程 |
+|------|-------------|-------------------|
+| ① 触发源 | 子进程调用 `exit()` / 收到终止信号 | 子进程调用 `ExitProcess()` / 被终止 |
+| ② 内核通知 | 内核向父进程发送 `SIGCHLD` 信号 | 内核将子进程 HANDLE 置为 signaled 状态 |
+| ③ 通知传递机制 | `signal-hook` 将 1 字节写入 `UnixStream` 配对 pipe | `RegisterWaitForSingleObject` 等待完成 |
+| | → `poller` 检测到 pipe 可读事件 | → 系统线程池执行 `child_exit_callback()` |
+| ④ 回调/转发动作 | (无额外回调，直接进入下一步) | 回调中：`GetExitCodeProcess()` 获取退出码 |
+| | | → `mpsc::Sender` 发送 `ChildEvent::Exited` |
+| | | → `poller.post(CompletionPacket)` 投递 IOCP 事件 |
+| ⑤ 事件循环感知 | `Poller::wait()` 返回 `PTY_CHILD_EVENT_TOKEN` 可读 | `Poller::wait()` 返回 `PTY_CHILD_EVENT_TOKEN` 事件 |
+| ⑥ 取退出状态 | ① 从信号管道读取 1 字节（清空） | `mpsc::Receiver::try_recv()` 取出事件 |
+| | ② `child.try_wait()` → `Option<ExitStatus>` | 事件内已包含 `Option<ExitStatus>` |
+| ⑦ 循环内收尾 | `drain_on_exit` 为真：`pty_read` 读取剩余数据 | 同左 |
+| | `terminal.lock().exit()` → 标记终端退出 | 同左 |
+| | `event_proxy.send_event(Event::Wakeup)` | 同左 |
+| | `break 'event_loop` → 退出事件循环 | 同左 |
+| ⑧ 线程结束清理 | `pty.deregister(poller)` → 注销事件源 | 同左 |
+| | 线程函数返回 `(self, state)` | 同左 |
+
+#### 4.3.2 Pty 资源释放顺序（Rust Drop 行为）
+
+**Rust Drop 规则**：结构体字段按**声明顺序依次 drop**（先声明的字段先被释放）。
+
+##### Unix Pty 释放顺序（[unix.rs#L309-L321](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L309-L321)）
+
+```rust
+pub struct Pty {
+    child: Child,          // 字段①：std::process::Child
+    file: File,            // 字段②：master 端文件
+    signals: UnixStream,   // 字段③：SIGCHLD 管道接收端
+    sig_id: SigId,         // 字段④：信号注册 ID
+}
+```
+
+| 字段顺序 | 字段 | Drop 行为 |
+|---------|------|----------|
+| (impl Drop 先执行) | — | `impl Drop for Pty` 块：`kill(SIGHUP)` → `unregister_signal(sig_id)` → `child.wait()` |
+| 字段④ | sig_id | 普通值类型，无特殊 drop |
+| 字段③ | signals | `UnixStream` drop，关闭管道 |
+| 字段② | file | `File` drop，关闭 master fd → 内核释放 PTY 资源 |
+| 字段① | child | `Child` drop，释放进程句柄 |
+
+##### Windows Pty 释放顺序（**生死攸关的顺序**，[windows/mod.rs#L27-L34](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/mod.rs#L27-L34)）
+
+```rust
+pub struct Pty {
+    // XXX: Backend 必须是第一个字段，保证正确的 drop 顺序。
+    // 先 drop conout 再 drop backend 会导致死锁。
+    backend: Backend,          // 字段①：Conpty (HPCON 句柄) ← 必须第一个！
+    conout: ReadPipe,          // 字段②：UnblockedReader<AnonRead>
+    conin: WritePipe,          // 字段③：UnblockedWriter<AnonWrite>
+    child_watcher: ChildExitWatcher, // 字段④：子进程退出监视器
+}
+```
+
+| 字段顺序 | 字段 | Drop 行为 | 关键说明 |
+|---------|------|----------|---------|
+| 字段① | backend | `impl Drop for Conpty`：`ClosePseudoConsole(handle)` | **阻塞等待 conout 管道数据被排空**！[conpty.rs#L97-L105](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/conpty.rs#L97-L105) |
+| 字段② | conout | `UnblockedReader` drop：join 后台线程 → 关闭 `piper` pipe → 关闭 `AnonRead` 管道句柄 | **必须在 backend 之后 drop**，否则 backend 的 ClosePseudoConsole 会永远等待一个已关闭的管道 → **死锁** |
+| 字段③ | conin | `UnblockedWriter` drop：join 后台线程 → 关闭 `piper` pipe → 关闭 `AnonWrite` 管道句柄 | |
+| 字段④ | child_watcher | `impl Drop for ChildExitWatcher`：`UnregisterWait(wait_handle)` | 取消等待回调注册，释放等待句柄 |
+
+> **🔴 死锁警告**：如果字段顺序写反了（`conout` 放在 `backend` 前面），那么：
+> 1. `conout` 先 drop → AnonRead 管道句柄被关闭
+> 2. `backend` 后 drop → 调用 `ClosePseudoConsole()`，该函数阻塞等待 conout 管道数据排空
+> 3. 但 conout 管道句柄已经关闭，永远不会有数据写完的信号
+> 4. → 线程永久阻塞，程序无法退出
 
 ---
 
