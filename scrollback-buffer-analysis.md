@@ -1,4 +1,8 @@
-# Alacritty 滚动缓冲用户滚动入口完整分析
+# Alacritty 滚动缓冲用户滚动入口完整分析（修正版）
+
+> **修正要点**：本文档特别澄清了此前的事实偏差——`ViModeCursor::scroll()` 不滚动视口（只计算光标位置），`vi_motion` 的自动滚动发生在 `ViModeCursor::motion()` 的末尾调用 `scroll_to_point`，搜索流程的滚动恢复仅在 Vi 模式下生效等。
+
+---
 
 ## 一、核心数据结构回顾
 
@@ -44,6 +48,21 @@ pub enum Scroll {
     Bottom,          // 滚动到底部
 }
 ```
+
+### 1.3 三个层级的 "scroll" 方法辨析（关键！）
+
+这是最容易混淆的地方，三个不同的 `scroll` 方法含义完全不同：
+
+| 方法名 | 所在位置 | 作用 | 是否修改 display_offset |
+|--------|---------|------|------------------------|
+| `Grid::scroll_display(scroll: Scroll)` | `grid/mod.rs:163` | 修改 Grid 的 `display_offset` | ✅ **是** |
+| `Term::scroll_display(scroll: Scroll)` | `term/mod.rs:389` | 调用 Grid::scroll_display + 钳位 vi 光标 + 标记损坏 | ✅ **是**（间接） |
+| **`ViModeCursor::scroll(term, lines: i32)`** | `vi_mode.rs:190` | **只计算光标新位置，不滚动视口！** 名称具有迷惑性 | ❌ **否** |
+| `ActionContext::scroll(scroll: Scroll)` | `event.rs:707` | 完整上下文滚动：记录偏移 + 调用 scroll_display + 同步选区/搜索/重绘 | ✅ **是**（间接） |
+| `scroll_terminal(x, y, mult)` | `input/mod.rs:760` | 鼠标滚轮决策逻辑，最终调用 `ctx.scroll` | ✅ **是**（间接） |
+| `scroll_to_point(point)` | `term/mod.rs:884` | 视口外时滚动视口使点可见 | ✅ **可能是**（点在视口外时） |
+
+**重点纠偏**：`ViModeCursor::scroll()` 方法命名虽然叫 "scroll"，但它 **完全不滚动视口**，只是辅助计算翻页时光标应该跳到的新位置。真正滚动视口由 `ctx.scroll()` 独立完成。
 
 ---
 
@@ -280,20 +299,17 @@ Processor::key_input (input/keyboard.rs:22)
 Processor::process_key_bindings (input/keyboard.rs:178)
         ↓
 Action::execute (input/mod.rs:168)
-        ├─→ 键盘绑定动作匹配
-        │    ├─→ Action::ScrollPageUp / ScrollPageDown
-        │    ├─→ Action::ScrollHalfPageUp / ScrollHalfPageDown
-        │    ├─→ Action::ScrollLineUp / ScrollLineDown
-        │    ├─→ Action::ScrollToTop / ScrollToBottom
-        │    └─→ Action::Vi(...) 中的滚动动作
-        └─→ ctx.scroll(Scroll::*)
-                ↓
+    ├─ 翻页滚动（ScrollPage*）：先调用 ViModeCursor::scroll() 【只算光标！】再 ctx.scroll
+    ├─ 单行滚动（ScrollLine*）：直接 ctx.scroll
+    ├─ ScrollToTop/Bottom：先 ctx.scroll，再 vi_motion(FirstOccupied) 【会 scroll_to_point】
+    └─ 其他动作（CenterAroundViCursor 等）
+            ↓
 ActionContext::scroll (event.rs:707)
-                ↓
+            ↓
 Term::scroll_display (term/mod.rs:389)
-                ↓
+            ↓
 Grid::scroll_display (grid/mod.rs:163)
-                ↓
+            ↓
 修改 display_offset
 ```
 
@@ -327,152 +343,531 @@ pub fn key_input(&mut self, key: KeyEvent) {
         return;
     }
 
-    // 提示模式、内联搜索等特殊路径...
-
-    // 步骤 3：尝试匹配键绑定
+    // 尝试匹配键绑定
     if self.process_key_bindings(&key) {
         return;  // 绑定匹配成功，跳过普通输入
     }
 
-    // 搜索输入、Vi 模式等处理...
-
-    // 普通字符输入 → 写入 PTY
+    // ... 普通字符输入 → 写入 PTY
 }
 ```
 
 **步骤 3：`process_key_bindings` 匹配绑定**
 
-`input/keyboard.rs:178` 匹配配置的键绑定：
+`input/keyboard.rs:178` 匹配配置的键绑定，匹配成功后执行 `action.execute(ctx)`。
+
+### 3.3 Action::execute 中滚动动作的详细分解（重点纠偏）
+
+**动作 1：翻页滚动（ScrollPageUp / ScrollPageDown / ScrollHalfPageUp / ScrollHalfPageDown）**
+
+`input/mod.rs:353-380` 是翻页滚动的完整实现。**请注意两步的分工：**
 
 ```rust
-fn process_key_bindings(&mut self, key: &KeyEvent) -> bool {
-    let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
-    let mods = self.ctx.modifiers().state();
-
-    let mut binding_action = |binding: &KeyBinding| {
-        // 构造匹配用的 key...
-        if binding.is_triggered_by(mode, mods, &key) {
-            Some(binding.action.clone())
-        } else { None }
+Action::ScrollPageUp
+| Action::ScrollPageDown
+| Action::ScrollHalfPageUp
+| Action::ScrollHalfPageDown => {
+    // ──── 第一步：计算 vi 光标新位置 ────
+    // ViModeCursor::scroll() 只是【计算光标目标位置】，不滚动视口！
+    let term = ctx.terminal_mut();
+    let (scroll, amount) = match self {
+        Action::ScrollPageUp => (Scroll::PageUp, term.screen_lines() as i32),
+        Action::ScrollPageDown => (Scroll::PageDown, -(term.screen_lines() as i32)),
+        Action::ScrollHalfPageUp => {
+            let amount = term.screen_lines() as i32 / 2;
+            (Scroll::Delta(amount), amount)
+        },
+        Action::ScrollHalfPageDown => {
+            let amount = -(term.screen_lines() as i32 / 2);
+            (Scroll::Delta(amount), amount)
+        },
+        _ => unreachable!(),
     };
 
-    // 遍历所有按键绑定
-    for i in 0..self.ctx.config().key_bindings().len() {
-        let binding = &self.ctx.config().key_bindings()[i];
-        if let Some(action) = binding_action(binding) {
-            action.execute(&mut self.ctx);  // ← 执行动作
-        }
+    let old_vi_cursor = term.vi_mode_cursor;
+    // ❗ 纠偏：ViModeCursor::scroll() 不滚动视口
+    // 它只把光标位置沿 amount 方向偏移（相当于"光标跟页一起滚"的视觉效果）
+    term.vi_mode_cursor = term.vi_mode_cursor.scroll(term, amount);
+    if old_vi_cursor != term.vi_mode_cursor {
+        ctx.mark_dirty();
     }
-    // ...
+
+    // ──── 第二步：真正滚动视口 ────
+    ctx.scroll(scroll);  // ✅ 这里才修改 display_offset
+},
+```
+
+**ViModeCursor::scroll() 的内部实现**（`vi_mode.rs:190`）：
+
+```rust
+// ❗ 名称有迷惑性：这个方法不做任何"滚动视口"的操作！
+pub fn scroll<T: EventListener>(mut self, term: &Term<T>, lines: i32) -> Self {
+    // 把光标位置减去 lines（向上滚 lines 行，光标跟着向上移动 lines 行）
+    let line = (self.point.line - lines).grid_clamp(term, Boundary::Grid);
+
+    // 找到目标行的第一个非空单元格
+    let column = first_occupied_in_line(term, line).unwrap_or_default().column;
+
+    // 只设置光标位置
+    self.point = Point::new(line, column);
+    self
 }
 ```
 
-**步骤 4：`Action::execute` 执行滚动动作**
+**动作 2：单行滚动（ScrollLineUp / ScrollLineDown）**
 
-`input/mod.rs:168` 的 `Execute` trait 实现中，滚动相关动作：
+`input/mod.rs:381-382`，最简单，直接滚动视口：
 
 ```rust
-impl<T: EventListener> Execute<T> for Action {
-    fn execute<A: ActionContext<T>>(&self, ctx: &mut A) {
-        match self {
-            // 整页滚动
-            Action::ScrollPageUp | Action::ScrollPageDown
-            | Action::ScrollHalfPageUp | Action::ScrollHalfPageDown => {
-                let term = ctx.terminal_mut();
-                let (scroll, amount) = match self {
-                    Action::ScrollPageUp => (Scroll::PageUp, term.screen_lines() as i32),
-                    Action::ScrollPageDown => (Scroll::PageDown, -(term.screen_lines() as i32)),
-                    Action::ScrollHalfPageUp => {
-                        let amount = term.screen_lines() as i32 / 2;
-                        (Scroll::Delta(amount), amount)
-                    },
-                    Action::ScrollHalfPageDown => {
-                        let amount = -(term.screen_lines() as i32 / 2);
-                        (Scroll::Delta(amount), amount)
-                    },
-                    _ => unreachable!(),
-                };
-
-                // 同步 vi 光标
-                let old_vi_cursor = term.vi_mode_cursor;
-                term.vi_mode_cursor = term.vi_mode_cursor.scroll(term, amount);
-                if old_vi_cursor != term.vi_mode_cursor {
-                    ctx.mark_dirty();
-                }
-
-                ctx.scroll(scroll);  // ← 调用滚动
-            },
-
-            // 单行滚动
-            Action::ScrollLineUp => ctx.scroll(Scroll::Delta(1)),
-            Action::ScrollLineDown => ctx.scroll(Scroll::Delta(-1)),
-
-            // 滚动到顶部
-            Action::ScrollToTop => {
-                ctx.scroll(Scroll::Top);
-                let topmost_line = ctx.terminal().topmost_line();
-                ctx.terminal_mut().vi_mode_cursor.point.line = topmost_line;
-                ctx.terminal_mut().vi_motion(ViMotion::FirstOccupied);
-                ctx.mark_dirty();
-            },
-
-            // 滚动到底部
-            Action::ScrollToBottom => {
-                ctx.scroll(Scroll::Bottom);
-                let term = ctx.terminal_mut();
-                term.vi_mode_cursor.point.line = term.bottommost_line();
-                term.vi_motion(ViMotion::FirstOccupied);
-                ctx.mark_dirty();
-            },
-
-            // Vi 模式下的 Centering 动作
-            Action::Vi(ViAction::CenterAroundViCursor) => {
-                let term = ctx.terminal();
-                let display_offset = term.grid().display_offset() as i32;
-                let target = -display_offset + term.screen_lines() as i32 / 2 - 1;
-                let line = term.vi_mode_cursor.point.line;
-                let scroll_lines = target - line.0;
-                ctx.scroll(Scroll::Delta(scroll_lines));
-            },
-
-            // ... 其他动作
-        }
-    }
-}
+Action::ScrollLineUp => ctx.scroll(Scroll::Delta(1)),
+Action::ScrollLineDown => ctx.scroll(Scroll::Delta(-1)),
 ```
 
-**步骤 5-7：同鼠标滚轮路径**
+**动作 3：滚动到顶部（ScrollToTop）**
 
-`ctx.scroll(Scroll::*)` → `ActionContext::scroll` → `Term::scroll_display` → `Grid::scroll_display`
-
-### 3.3 Vi 模式下的滚动
-
-在 Vi 模式下，移动 vi 光标也可能触发滚动（光标移动到视口外时自动滚动）：
-
-`term/mod.rs:893` 的 `vi_motion` 中：
+`input/mod.rs:383-391`：
 
 ```rust
-pub fn vi_motion(&mut self, motion: ViMotion) {
-    // ...
-    // 如果光标超出视口，自动滚动
-    if self.vi_mode_cursor.point.line < Line(-(self.grid.display_offset() as i32)) {
-        let scroll = self.grid.display_offset() as i32 + self.vi_mode_cursor.point.line.0;
-        self.scroll_display(Scroll::Delta(-scroll));
-    } else if self.vi_mode_cursor.point.line
-        > Line(-(self.grid.display_offset() as i32) + self.bottommost_line().0)
-    {
-        let scroll = self.grid.display_offset() as i32 + self.vi_mode_cursor.point.line.0
-            - self.bottommost_line().0;
-        self.scroll_display(Scroll::Delta(-scroll));
-    }
-}
+Action::ScrollToTop => {
+    // 第一步：先滚到底（最顶部历史）
+    ctx.scroll(Scroll::Top);                 // ✅ 修改 display_offset = history_size()
+
+    // 第二步：把 vi 光标移到最顶行，再找第一个非空字符
+    // vi_motion 末尾会调用 scroll_to_point，但视口已在顶部，通常不会再滚动
+    // （如果非 Vi 模式，Term::vi_motion 直接 return）
+    let topmost_line = ctx.terminal().topmost_line();
+    ctx.terminal_mut().vi_mode_cursor.point.line = topmost_line;
+    ctx.terminal_mut().vi_motion(ViMotion::FirstOccupied);
+    ctx.mark_dirty();
+},
+```
+
+**动作 4：滚动到底部（ScrollToBottom）**
+
+`input/mod.rs:392-403`：
+
+```rust
+Action::ScrollToBottom => {
+    ctx.scroll(Scroll::Bottom);              // ✅ display_offset = 0
+
+    let term = ctx.terminal_mut();
+    term.vi_mode_cursor.point.line = term.bottommost_line();
+
+    // 调用两次 FirstOccupied，处理跨行换行的情况
+    term.vi_motion(ViMotion::FirstOccupied);  // ← 会调用 scroll_to_point
+    term.vi_motion(ViMotion::FirstOccupied);
+    ctx.mark_dirty();
+},
+```
+
+**动作 5：以 vi 光标为中心滚动（CenterAroundViCursor）**
+
+`input/mod.rs`（ViAction 分支）：
+
+```rust
+Action::Vi(ViAction::CenterAroundViCursor) => {
+    let term = ctx.terminal();
+    let display_offset = term.grid().display_offset() as i32;
+    // 目标：让 vi 光标位于屏幕中间
+    let target = -display_offset + term.screen_lines() as i32 / 2 - 1;
+    let line = term.vi_mode_cursor.point.line;
+    let scroll_lines = target - line.0;  // 计算需要滚动的行数
+    ctx.scroll(Scroll::Delta(scroll_lines));  // ✅ 修改 display_offset
+},
 ```
 
 ---
 
-## 四、触摸滚动完整调用链
+## 四、Vi 模式滚动：自动滚动机制与各动作辨析
 
-### 4.1 调用链路总览
+### 4.1 `Term::vi_motion` —— 顶层入口
+
+`term/mod.rs:839`：
+
+```rust
+pub fn vi_motion(&mut self, motion: ViMotion)
+where
+    T: EventListener,
+{
+    if !self.mode.contains(TermMode::VI) {
+        return;  // 非 Vi 模式直接退出
+    }
+
+    // 移动光标（motion 方法内部会在末尾检查是否需要滚动）
+    self.vi_mode_cursor = self.vi_mode_cursor.motion(self, motion);
+    self.vi_mode_recompute_selection();
+}
+```
+
+### 4.2 `ViModeCursor::motion()` —— 自动滚动的真正触发点（关键纠偏）
+
+`vi_mode.rs:74-186` 是所有 Vi 移动动作的实现。**关键机制：先移动光标，再在方法末尾统一调用一次 `scroll_to_point` 检查是否需要滚动视口。**
+
+```rust
+pub fn motion<T: EventListener>(mut self, term: &mut Term<T>, motion: ViMotion) -> Self {
+    // ──── 第一步：根据动作类型移动光标（只改 point，不改 display_offset）────
+    match motion {
+        ViMotion::Up => {
+            if self.point.line > term.topmost_line() {
+                self.point.line -= 1;  // 只改光标位置
+            }
+        },
+        ViMotion::Down => {
+            if self.point.line + 1 < term.screen_lines() as i32 {
+                self.point.line += 1;  // 只改光标位置
+            }
+        },
+        ViMotion::Left => { /* 复杂的跨行换行逻辑，只改 point */ },
+        ViMotion::Right => { /* ... */ },
+        ViMotion::High => {
+            // 跳转到【当前视口】顶部行（基于当前 display_offset，不改变视口）
+            let line = Line(-(term.grid().display_offset() as i32));
+            let col = first_occupied_in_line(term, line).unwrap_or_default().column;
+            self.point = Point::new(line, col);
+            // 因为是视口内跳转，下面 scroll_to_point 不会触发滚动
+        },
+        ViMotion::Middle => {
+            // 跳转到【当前视口】中间行
+            let display_offset = term.grid().display_offset() as i32;
+            let line = Line(-display_offset + term.screen_lines() as i32 / 2 - 1);
+            // ... 设置 self.point
+        },
+        ViMotion::Low => {
+            // 跳转到【当前视口】底部行
+            let display_offset = term.grid().display_offset() as i32;
+            let line = Line(-display_offset + term.screen_lines() as i32 - 1);
+            // ...
+        },
+        ViMotion::FirstOccupied => { /* 找第一个非空字符 */ },
+        ViMotion::SemanticLeft => { /* 语义词跳转，只改 point */ },
+        ViMotion::WordRight => { /* 词跳转，只改 point */ },
+        ViMotion::Bracket => { self.point = term.bracket_search(self.point).unwrap_or(self.point); },
+        ViMotion::ParagraphUp => { /* 段落跳转，只改 point */ },
+        ViMotion::ParagraphDown => { /* ... */ },
+        // ... 其他动作都是只改 point
+    }
+
+    // ──── 第二步：统一检查光标是否在视口外，需要则滚动 ────
+    // ✅ 所有 Vi 动作都会走到这一行
+    term.scroll_to_point(self.point);
+
+    self
+}
+```
+
+**结论**：
+- 所有 `vi_motion` 动作都 **可能** 触发视口滚动（如果光标最终位置在视口外）
+- `High/Middle/Low` 是相对于当前视口定位，因此这些动作 **通常不会** 触发滚动（除非视口在这期间被别的事件改变了）
+
+### 4.3 `scroll_to_point` —— 视口外才滚动
+
+`term/mod.rs:884`：
+
+```rust
+pub fn scroll_to_point(&mut self, point: Point)
+where
+    T: EventListener,
+{
+    let display_offset = self.grid.display_offset() as i32;
+    let screen_lines = self.grid.screen_lines() as i32;
+
+    // 视口范围：[-display_offset, screen_lines - display_offset)
+    // 点在视口上方 → 向上滚（减小 display_offset）
+    if point.line < -display_offset {
+        let lines = point.line + display_offset;
+        self.scroll_display(Scroll::Delta(-lines.0));  // ✅ 改 display_offset
+    }
+    // 点在视口下方 → 向下滚（增大 display_offset）
+    else if point.line >= (screen_lines - display_offset) {
+        let lines = point.line + display_offset - screen_lines + 1i32;
+        self.scroll_display(Scroll::Delta(-lines.0));  // ✅ 改 display_offset
+    }
+    // 点在视口内：什么都不做
+}
+```
+
+### 4.4 `vi_goto_point` —— 先滚再设光标
+
+`term/mod.rs:855`：
+
+```rust
+pub fn vi_goto_point(&mut self, point: Point)
+where
+    T: EventListener,
+{
+    // 先滚动视口让点可见
+    self.scroll_to_point(point);               // ✅ 可能改 display_offset
+
+    // 再设置光标
+    self.vi_mode_cursor.point = point;
+
+    self.vi_mode_recompute_selection();
+}
+```
+
+这个方法用于搜索跳转、提示跳转等场景，先保证点可见，再把光标放上去。
+
+### 4.5 Vi 模式各动作滚动行为对照表
+
+| Vi 动作 | 是否可能滚动视口 | 原因 |
+|---------|-----------------|------|
+| `Up/Down` | ✅ 是 | 光标移出视口时触发 `scroll_to_point` |
+| `Left/Right` | ✅ 是 | 跨行换行时光标可能移出视口 |
+| `First/Last` | ✅ 是 | 跨 wrap 行搜索可能移出视口 |
+| `FirstOccupied` | ✅ 是 | 同上，跨 wrap 搜索可能移出 |
+| **`High/Middle/Low`** | ⚠️ 通常不 | 基于当前视口定位，结果点在视口内；极端情况才滚 |
+| `SemanticLeft/Right*` | ✅ 是 | 语义词搜索可能跨出视口 |
+| `WordLeft/Right*` | ✅ 是 | 词搜索可能跨出视口 |
+| `Bracket` | ✅ 是 | 括号配对可能在视口外 |
+| `ParagraphUp/Down` | ✅ 是 | 段落搜索可能跨出视口 |
+| **翻页滚动**（PageUp/Down 等）| ✅ **必定触发** | 独立调用 `ctx.scroll()`，不是通过 `vi_motion` |
+| **ScrollToTop/Bottom** | ✅ **必定触发** | 独立调用 `ctx.scroll(Scroll::Top/Bottom)` |
+| `CenterAroundViCursor` | ✅ **必定触发** | 独立计算偏移后调用 `ctx.scroll` |
+
+---
+
+## 五、搜索跳转完整流程的滚动分析（重点纠偏）
+
+### 5.1 搜索全流程概览
+
+```
+start_search()           —— 保存 origin，不滚动视口
+       ↓
+search_input(c)         —— 用户输入搜索词
+       ↓
+update_search()         —— 每输入一个字符调用一次
+       ↓
+goto_match(limit=1000) —— 限制范围内查找，找到就跳
+  ├─ Vi 模式：vi_goto_point()       ← 先滚动再设光标 ✅
+  └─ 非 Vi 模式：scroll_to_point()  ← 只滚动视口 ✅
+       ↓
+advance_search_origin() —— 用户按 Enter/N 键跳转下一条
+  ├─ scroll_to_point(new_origin)    ← 先对齐到当前匹配 ✅
+  └─ goto_match(None)               ← 无限制查找下一条 ✅
+       ↓
+cancel_search() / confirm_search() —— 退出搜索
+  ├─ Vi 模式：search_reset_state()  ← 恢复视口和光标 ✅
+  └─ 非 Vi 模式：创建选区（取消时）/ 直接退出（确认时），不恢复视口 ❌
+```
+
+### 5.2 `start_search()` —— **不滚动视口**
+
+`event.rs:946`：
+
+```rust
+fn start_search(&mut self, direction: Direction) {
+    // ... 初始化历史、方向 ...
+
+    // 只保存 origin 点，不做任何滚动
+    if self.terminal.mode().contains(TermMode::VI) {
+        self.search_state.origin = self.terminal.vi_mode_cursor.point;  // Vi 模式：从 vi 光标开始
+        self.search_state.display_offset_delta = 0;
+        // ... 光标在底部时 origin 上移一行，为新内容腾出空间（不滚动，只是记录点）
+    } else {
+        // 非 Vi 模式：origin 从视口边界开始
+        let viewport_top = Line(-(self.terminal.grid().display_offset() as i32)) - 1;
+        // ...
+    }
+    // ❌ 注意：start_search 本身不调用任何 scroll_display / scroll / scroll_to_point
+}
+```
+
+### 5.3 `update_search()` → `goto_match(limit)` —— **找到匹配就滚动**
+
+`event.rs:1503-1527`：
+
+```rust
+fn update_search(&mut self) {
+    let regex = match self.search_state.regex() { /* ... */ };
+
+    if regex.is_empty() {
+        // 空搜索词：恢复初始状态（Vi 模式下会恢复视口）
+        self.search_reset_state();  // ← 仅 Vi 模式恢复视口
+        self.search_state.dfas = None;
+    } else {
+        self.search_state.dfas = RegexSearch::new(regex).ok();
+        // ✅ 每输入一个字符都尝试查找匹配，找到就跳转
+        self.goto_match(MAX_SEARCH_WHILE_TYPING);  // limit=1000 行
+    }
+
+    *self.dirty = true;
+}
+```
+
+### 5.4 `goto_match()` —— 搜索跳转的滚动实现
+
+`event.rs:1554-1605`，核心跳转逻辑：
+
+```rust
+fn goto_match(&mut self, mut limit: Option<usize>) {
+    let dfas = match &mut self.search_state.dfas { /* ... */ };
+
+    match self.terminal.search_next(dfas, clamped_origin, direction, Side::Left, limit) {
+        Some(regex_match) => {
+            let old_offset = self.terminal.grid().display_offset() as i32;
+
+            if self.terminal.mode().contains(TermMode::VI) {
+                // ✅ Vi 模式：先滚动视口让匹配可见，再设光标
+                self.terminal.vi_goto_point(*regex_match.start());
+            } else {
+                // ✅ 非 Vi 模式：只滚动视口让匹配可见（没有 vi 光标）
+                self.terminal.scroll_to_point(*regex_match.start());
+            }
+
+            // 记录偏移变化（用于 search_reset_state 恢复视口）
+            let display_offset = self.terminal.grid().display_offset();
+            self.search_state.display_offset_delta += old_offset - display_offset as i32;
+
+            self.search_state.focused_match = Some(regex_match);
+        },
+        None if limit.is_none() => self.search_reset_state(),  // 无限搜索没找到：恢复
+        None => { /* 有限搜索没找到，延迟继续 */ },
+    }
+    *self.dirty = true;
+}
+```
+
+### 5.5 `advance_search_origin()` —— **跳转前后都涉及滚动**
+
+`event.rs:1132-1149`，用户按 "下一条 / 上一条" 时触发：
+
+```rust
+fn advance_search_origin(&mut self, direction: Direction) {
+    if let Some(focused_match) = &self.search_state.focused_match {
+        let new_origin = match direction {
+            Direction::Right => focused_match.end().add(self.terminal, Boundary::None, 1),
+            Direction::Left => focused_match.start().sub(self.terminal, Boundary::None, 1),
+        };
+
+        // ✅ 先对齐 origin 到当前匹配（如果匹配不在视口内，会先滚回来）
+        self.terminal.scroll_to_point(new_origin);
+
+        // 重置 offset 计数器，从当前位置开始记新的变化
+        self.search_state.display_offset_delta = 0;
+        self.search_state.origin = new_origin;
+    }
+
+    // ✅ 再跳到下一条（会再次滚动）
+    let search_direction = mem::replace(&mut self.search_state.direction, direction);
+    self.goto_match(None);  // 无限制查找
+    self.search_state.direction = search_direction;
+}
+```
+
+### 5.6 `cancel_search()` —— **仅 Vi 模式恢复视口（重点纠偏）**
+
+`event.rs:1047-1063`：
+
+```rust
+fn cancel_search(&mut self) {
+    if self.terminal.mode().contains(TermMode::VI) {
+        // ✅ Vi 模式：恢复搜索前的光标位置和视口
+        self.search_reset_state();
+    } else if let Some(focused_match) = &self.search_state.focused_match {
+        // ❌ 非 Vi 模式：不恢复视口！而是创建选区，停留在匹配位置
+        let start = *focused_match.start();
+        let end = *focused_match.end();
+        self.start_selection(SelectionType::Simple, start, Side::Left);
+        self.update_selection(end, Side::Right);
+        self.copy_selection(ClipboardType::Selection);
+    }
+
+    self.search_state.dfas = None;
+    self.exit_search();
+}
+```
+
+**`search_reset_state()` 的具体实现**（`event.rs:1530-1551`）：
+
+```rust
+fn search_reset_state(&mut self) {
+    // 取消延迟搜索
+    // ...
+
+    self.search_state.focused_match = None;
+
+    // ⚠️ 只在 Vi 模式下恢复视口！非 Vi 模式直接 return
+    if !self.terminal.mode().contains(TermMode::VI) {
+        return;
+    }
+
+    // 恢复光标到搜索前 origin
+    self.terminal.vi_mode_cursor.point = self.search_state.origin;
+    // ✅ 恢复视口到搜索前位置（display_offset_delta 存了累计偏移）
+    self.terminal.scroll_display(Scroll::Delta(self.search_state.display_offset_delta));
+    self.search_state.display_offset_delta = 0;
+
+    *self.dirty = true;
+}
+```
+
+### 5.7 `confirm_search()` —— **非 Vi 模式=取消，Vi 模式=保持**
+
+`event.rs:1030-1044`：
+
+```rust
+fn confirm_search(&mut self) {
+    // 非 Vi 模式：直接取消（会创建匹配的选区，不恢复视口）
+    if !self.terminal.mode().contains(TermMode::VI) {
+        self.cancel_search();
+        return;
+    }
+
+    // Vi 模式：取消之前被中断的延迟搜索，退出搜索（保持当前视口/光标位置）
+    if self.scheduler.scheduled(timer_id) {
+        self.goto_match(None);
+    }
+    self.exit_search();
+}
+```
+
+### 5.8 `start_seeded_search()` —— 带初始文本的搜索
+
+`event.rs:984-1027`：
+
+```rust
+fn start_seeded_search(&mut self, direction: Direction, text: String) {
+    // ... 先 start_search，再逐字符输入搜索词（触发多次 update_search → goto_match）
+    // ... confirm_search 退出搜索
+
+    if !self.terminal.mode().contains(TermMode::VI) {
+        return;  // 非 Vi 模式到此结束
+    }
+
+    // ✅ Vi 模式：再做一次更精准的跳转，找到 origin 之后的下一个目标方向匹配
+    let target = self.search_next(origin, Direction::Right, Side::Right).and_then(|rm| {
+        // ... 根据目标方向找到更精确的匹配位置
+    });
+
+    if let Some(target) = target {
+        // ✅ 最终用 vi_goto_point（滚+设光标）把光标定到目标上
+        self.terminal_mut().vi_goto_point(target);
+        self.mark_dirty();
+    }
+}
+```
+
+### 5.9 搜索流程滚动对照表
+
+| 搜索步骤 | 是否触发视口滚动 | 说明 |
+|---------|-----------------|------|
+| `start_search()` | ❌ **否** | 只记录 origin，不做任何滚动 |
+| `search_input(c)` → `update_search()` | ✅ 有匹配时 | `goto_match(1000)` 找到匹配就跳 |
+| `goto_match(limit)` — Vi 模式 | ✅ **是** | 调用 `vi_goto_point` → `scroll_to_point` + 设光标 |
+| `goto_match(limit)` — 非 Vi 模式 | ✅ 匹配在视口外时 | 只调用 `scroll_to_point`，不设光标 |
+| `advance_search_origin()`（下一条） | ✅ **是** | 先 `scroll_to_point(new_origin)` 再 `goto_match(None)` |
+| 搜索词清空 | ⚠️ 仅 Vi 模式 | 调用 `search_reset_state` 恢复视口 |
+| `cancel_search()` — Vi 模式 | ✅ **是** | `search_reset_state` 恢复视口和光标 |
+| `cancel_search()` — 非 Vi 模式 | ❌ **否** | 不恢复视口，而是创建选区，停留在匹配处 |
+| `confirm_search()` — Vi 模式 | ❌ 通常不 | 只是退出搜索，保持当前状态（无结果时可能滚动） |
+| `confirm_search()` — 非 Vi 模式 | ❌ **否** | 等价于 cancel_search → 创建选区 |
+| `start_seeded_search()` Vi 模式 | ✅ 可能多次 | update_search 多次跳转 + 最终 vi_goto_point |
+
+---
+
+## 六、触摸滚动完整调用链
+
+### 6.1 调用链路总览
 
 ```
 winit WindowEvent::Touch
@@ -480,7 +875,7 @@ winit WindowEvent::Touch
 Processor::touch (input/mod.rs:840)
         ├─→ TouchPhase::Started  → on_touch_start  (判定是 Tap/Scroll/Select/Zoom)
         ├─→ TouchPhase::Moved    → on_touch_motion
-        │       ├─→ 判定手势类型（Tap→Scroll/Select）
+        │       ├─→ 判定手势类型（横向→Select / 纵向→Scroll，阈值 20px）
         │       ├─→ TouchPurpose::Scroll  → scroll_terminal(0, delta_y, 1.0)
         │       ├─→ TouchPurpose::Select  → mouse_moved
         │       └─→ TouchPurpose::Zoom    → change_font_size
@@ -489,7 +884,7 @@ Processor::touch (input/mod.rs:840)
 scroll_terminal → ctx.scroll → Term::scroll_display → Grid::scroll_display
 ```
 
-### 4.2 详细调用步骤
+### 6.2 详细调用步骤
 
 **步骤 1：触摸事件入口**
 
@@ -542,7 +937,6 @@ pub fn on_touch_motion(&mut self, touch: TouchEvent) {
             let delta_y = touch.location.y - start.location.y;
             if delta_x.abs() > MAX_TAP_DISTANCE {       // 横向移动 > 20px
                 *touch_purpose = TouchPurpose::Select(*start);  // → 文本选择
-                // ... 模拟鼠标按下
             } else if delta_y.abs() > MAX_TAP_DISTANCE { // 纵向移动 > 20px
                 *touch_purpose = TouchPurpose::Scroll(*start);  // → 滚动模式
                 self.on_touch_motion(touch);            // 立即应用当前移动
@@ -552,30 +946,22 @@ pub fn on_touch_motion(&mut self, touch: TouchEvent) {
         TouchPurpose::Scroll(last_touch) => {
             let delta_y = touch.location.y - last_touch.location.y;
             *touch_purpose = TouchPurpose::Scroll(touch);
-            // multiplier = 1.0，触控屏跟随手指移动
+            // multiplier = 1.0，触控屏跟随手指移动（不做滚轮式放大）
             self.scroll_terminal(0., delta_y, 1.0);
         },
         TouchPurpose::Select(_) => self.mouse_moved(touch.location),
-        TouchPurpose::Zoom(zoom) => {
-            let font_delta = zoom.font_delta(touch);
-            self.ctx.change_font_size(font_delta);
-        },
-        // ...
+        TouchPurpose::Zoom(zoom) => { /* 缩放 */ },
     }
 }
 ```
 
 **关键点**：触摸滚动的 multiplier 固定为 `1.0`，实现精确的手指跟随滚动。
 
-**步骤 5+：同鼠标滚轮路径**
-
-`scroll_terminal` 的四个分支逻辑与鼠标滚轮完全相同。
-
 ---
 
-## 五、其他滚动入口
+## 七、其他滚动入口
 
-### 5.1 输入时自动回到底部
+### 7.1 输入时自动回到底部
 
 `event.rs:1359` 当用户开始输入时，如果正在查看历史，自动滚回到底部：
 
@@ -584,7 +970,7 @@ fn on_terminal_input_start(&mut self) {
     self.on_typing_start();
     self.clear_selection();
 
-    // 如果不在底部，自动滚回
+    // ✅ 如果不在底部，自动滚回
     if self.terminal().grid().display_offset() != 0 {
         self.scroll(Scroll::Bottom);
     }
@@ -593,7 +979,7 @@ fn on_terminal_input_start(&mut self) {
 
 调用时机：普通字符输入、粘贴、写入 PTY 前。
 
-### 5.2 选择时自动滚动
+### 7.2 选择时自动滚动
 
 `input/mod.rs:1116` 鼠标选择拖到窗口边缘时自动滚动：
 
@@ -609,7 +995,7 @@ fn update_selection_scrolling(&mut self, mouse_y: i32) {
         return;
     };
 
-    // 构造 Scroll 事件，定时触发
+    // ✅ 构造 Scroll 事件，定时触发
     let event = Event::new(EventType::Scroll(Scroll::Delta(delta / step)), Some(window_id));
     scheduler.schedule(event, SELECTION_SCROLLING_INTERVAL, true, timer_id);
 }
@@ -617,88 +1003,33 @@ fn update_selection_scrolling(&mut self, mouse_y: i32) {
 
 `SELECTION_SCROLLING_INTERVAL = 15ms`，每 15ms 滚动一次，速度与距离边缘的距离成正比。
 
-### 5.3 搜索结果跳转滚动
+### 7.3 提示键盘跳转
 
-`event.rs:1167` 搜索匹配时跳转到结果位置：
-
-```rust
-self.terminal.scroll_to_point(new_origin);  // term/mod.rs: 滚动使点可见
-```
-
-搜索取消时恢复原视口：
+`event.rs:1271`：
 
 ```rust
-// event.rs:1547
-self.terminal.scroll_display(Scroll::Delta(self.search_state.display_offset_delta));
-```
-
-### 5.4 WindowContext 搜索启动时的微调滚动
-
-`window_context.rs:554` 搜索启动时根据光标位置微调视口：
-
-```rust
-if display_offset == 0 && cursor_at_bottom && !origin_at_bottom {
-    terminal.scroll_display(Scroll::Delta(1));
-} else if display_offset != 0 && origin_at_bottom {
-    terminal.scroll_display(Scroll::Delta(-1));
-}
-```
-
----
-
-## 六、`scroll` 方法在不同上下文的实现
-
-### 6.1 `ActionContext` trait 中的默认实现
-
-`input/mod.rs:96` 提供空实现，由具体上下文覆盖：
-
-```rust
-pub trait ActionContext<T: EventListener> {
-    fn scroll(&mut self, _scroll: Scroll) {}  // 默认空实现
+HintAction::Text => {
+    // ✅ 跳到提示起点
+    self.terminal.vi_goto_point(*hint_bounds.start());
     // ...
 }
 ```
 
-### 6.2 `ActionContext` for `ActionContext`（事件处理上下文）
+### 7.4 WindowContext 搜索启动时的微调
 
-`event.rs:707` — 实际用于鼠标/键盘滚动的完整实现：
-
-```rust
-impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
-    fn scroll(&mut self, scroll: Scroll) {
-        // 完整实现：记录旧偏移、调用 scroll_display、同步选区、搜索状态、标记重绘
-        // 详见 2.2 步骤 4
-    }
-}
-```
-
-### 6.3 `ActionContext` for `ActionContext`（测试 Mock）
-
-`input/mod.rs:1218` — 测试用简化实现：
+`window_context.rs:554` 搜索启动时根据光标位置微调视口（避免搜索 origin 被新输出推离视口）：
 
 ```rust
-impl<T: EventListener> super::ActionContext<T> for ActionContext<'_, T> {
-    fn scroll(&mut self, scroll: Scroll) {
-        self.terminal.scroll_display(scroll);  // 只改 display_offset
-    }
+if display_offset == 0 && cursor_at_bottom && !origin_at_bottom {
+    terminal.scroll_display(Scroll::Delta(1));   // ✅ 向上滚 1 行
+} else if display_offset != 0 && origin_at_bottom {
+    terminal.scroll_display(Scroll::Delta(-1));  // ✅ 向下滚 1 行
 }
 ```
-
-### 6.4 `Processor::scroll` — 鼠标滚轮路径
-
-`input/mod.rs:725-828` — 处理 `MouseScrollDelta`，多分支决策后调用 `ctx.scroll`。
-
-### 6.5 `Term::scroll_display` — 终端层
-
-`term/mod.rs:389` — 负责 vi 光标钳位、损坏标记。
-
-### 6.6 `Grid::scroll_display` — 网格层
-
-`grid/mod.rs:163` — 只修改 `display_offset`，纯逻辑操作。
 
 ---
 
-## 七、完整调用关系图
+## 八、完整调用关系图
 
 ```
                                  ┌───────────────────────────┐
@@ -718,14 +1049,20 @@ scroll_terminal (input/mod.rs)    process_key_bindings            on_touch_motio
     4 个分支决策                          │                              │
     ├─ process_mouse_bindings ───→ Action::execute ←───────────────────┘
     │       │                    (input/mod.rs:168)
-    │       │                         匹配动作类型
-    │       │                    ┌─────┼─────┬────────┬────────┬────────┐
-    │       │                    ▼     ▼     ▼        ▼        ▼        ▼
-    │       │                Scroll  Scroll  Scroll  Scroll  ScrollTo  ViCenter
-    │       │                PageUp  PageDn  LineUp  LineDn  Top/Bottom
-    │       │                    │     │     │        │        │        │
-    │       └────────────────────┴─────┴─────┴────────┴────────┴────────┘
-    │                                       │
+    │       │             ┌────────┬──────┴──────┬────────┬────────┬──────────┐
+    │       │             ▼        ▼             ▼        ▼        ▼          ▼
+    │       │        Scroll*   Scroll*     ScrollLine*  Center   Scroll*     Vi 动作
+    │       │        PageUp    PageDown    Up/Down   AroundVi  ToTop/Btm  (Up/Down/etc)
+    │       │             │        │         │        Cursor     │          │
+    │       │             │        │         │           │       │          │
+    │       │             │  ViModeCursor::scroll()  │     ctx.scroll  Term::vi_motion
+    │       │             │  ❗ 只算光标！          │       │         │
+    │       │             │  不滚动视口             │       │    ViModeCursor::motion()
+    │       │             └────────┴─────────┴───────────┘       │         │
+    │       │                         │                          │      移动光标
+    │       │                         │                          │         │
+    │       └─────────────────────────┴──────────────────────────┘    scroll_to_point
+    │                                       │                         (视口外才滚)
     ├─ mouse_report (鼠标模式)              │
     ├─ write_to_pty (Alt Screen)            │
     └────────────────────────────────────────┘
@@ -760,9 +1097,9 @@ scroll_terminal (input/mod.rs)    process_key_bindings            on_touch_motio
 
 ---
 
-## 八、关键设计要点
+## 九、关键设计要点与纠偏总结
 
-### 8.1 滚动优先级设计
+### 9.1 滚动优先级设计
 
 `scroll_terminal` 的四个分支按优先级顺序判断：
 
@@ -771,7 +1108,7 @@ scroll_terminal (input/mod.rs)    process_key_bindings            on_touch_motio
 3. **Alt Screen + Alternate Scroll**：滚轮转成上下键发送给应用
 4. **默认滚动**（最低优先级）：直接修改视口偏移
 
-### 8.2 累积滚动机制
+### 9.2 累积滚动机制
 
 像素滚动（触控板）使用 `accumulated_scroll` 累积像素值，达到整行高度才触发滚动，避免抖动：
 
@@ -782,7 +1119,7 @@ let lines = (self.ctx.mouse().accumulated_scroll.y / height).abs() as usize;
 self.ctx.mouse_mut().accumulated_scroll.y %= height;
 ```
 
-### 8.3 视口锚定
+### 9.3 视口锚定
 
 当用户查看历史时（`display_offset != 0`），新的终端输出不会把视口拉回底部，而是"推高" `display_offset`：
 
@@ -793,7 +1130,38 @@ if self.display_offset != 0 {
 }
 ```
 
-### 8.4 触摸手势识别
+### 9.4 纠偏：`ViModeCursor::scroll()` 不滚动视口
+
+这是最容易产生误解的命名。`ViModeCursor::scroll()` 只是翻页滚动时计算光标新位置的辅助方法。翻页滚动的视口滚动由独立的 `ctx.scroll(scroll)` 调用完成。二者配合的视觉效果是"页和光标一起滚"，但代码层面是两个独立的步骤。
+
+### 9.5 纠偏：非 Vi 模式下取消搜索不恢复视口
+
+`search_reset_state()` 只在 Vi 模式下恢复视口和光标：
+
+```rust
+fn search_reset_state(&mut self) {
+    // ...
+    if !self.terminal.mode().contains(TermMode::VI) {
+        return;  // ⚠️ 非 Vi 模式直接退出，不恢复视口
+    }
+    // 仅 Vi 模式执行恢复
+}
+```
+
+非 Vi 模式下 `cancel_search()` 会为匹配创建选区，视口停留在匹配位置。这是刻意的设计区分。
+
+### 9.6 纠偏：`vi_motion` 的自动滚动在方法末尾统一触发
+
+不是每个 Vi 动作单独判断滚动，而是所有动作在 `ViModeCursor::motion()` 末尾统一调用一次 `term.scroll_to_point(self.point)`：
+
+```rust
+// vi_mode.rs:183
+term.scroll_to_point(self.point);  // 所有 Vi 动作都经过这里
+```
+
+因此 `High/Middle/Low` 虽然是基于当前视口计算点，但依然会执行 scroll_to_point 检查（只是结果通常在视口内，不触发实际滚动）。
+
+### 9.7 触摸手势识别
 
 单指触摸超过 20px 阈值时才判定为滚动/选择，避免点击误触发：
 
@@ -804,39 +1172,40 @@ if delta_y.abs() > MAX_TAP_DISTANCE {
 }
 ```
 
-### 8.5 边缘选择自动滚动
+### 9.8 边缘选择自动滚动
 
-选择文本拖到窗口边缘时，滚动速度与距离边缘的距离成正比，每 15ms 触发一次：
-
-```rust
-let delta = if mouse_y < end_top {
-    end_top - mouse_y + step    // 越靠上滚越快
-} else if mouse_y >= start_bottom {
-    start_bottom - mouse_y - step  // 越靠下滚越快
-} else { ... };
-```
+选择文本拖到窗口边缘时，滚动速度与距离边缘的距离成正比，每 15ms 触发一次。
 
 ---
 
-## 九、代码参考（相对路径）
+## 十、代码参考（相对路径）
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|--------|
-| Grid::scroll_display | alacritty_terminal/src/grid/mod.rs | 163-173 |
-| Grid::display_offset | alacritty_terminal/src/grid/mod.rs | 134 |
-| Term::scroll_display | alacritty_terminal/src/term/mod.rs | 389-408 |
-| Term::scroll_to_point | alacritty_terminal/src/term/mod.rs | - |
-| MouseScrollDelta 处理 | alacritty/src/input/mod.rs | 725-828 |
-| scroll_terminal | alacritty/src/input/mod.rs | 760-828 |
-| process_mouse_bindings | alacritty/src/input/mod.rs | 1039-1068 |
-| key_input | alacritty/src/input/keyboard.rs | 22-103 |
-| process_key_bindings | alacritty/src/input/keyboard.rs | 178-249 |
-| Action::execute (滚动) | alacritty/src/input/mod.rs | 353-401 |
-| ActionContext::scroll | alacritty/src/event.rs | 707-741 |
-| on_terminal_input_start | alacritty/src/event.rs | 1359-1366 |
-| update_selection_scrolling | alacritty/src/input/mod.rs | 1116-1148 |
-| touch/on_touch_motion | alacritty/src/input/mod.rs | 840-924 |
-| TouchPurpose enum | alacritty/src/event.rs | 1711 |
-| 搜索滚动 | alacritty/src/event.rs | 1160-1172, 1530-1551 |
-| 窗口上下文滚动 | alacritty/src/window_context.rs | 554-559 |
-| Scrolling 配置 | alacritty/src/config/scrolling.rs | 1-53 |
+| Grid::scroll_display | `alacritty_terminal/src/grid/mod.rs` | 163-173 |
+| Term::scroll_display | `alacritty_terminal/src/term/mod.rs` | 389-408 |
+| Term::vi_motion | `alacritty_terminal/src/term/mod.rs` | 839-851 |
+| Term::vi_goto_point | `alacritty_terminal/src/term/mod.rs` | 855-866 |
+| **Term::scroll_to_point** | `alacritty_terminal/src/term/mod.rs` | 884-898 |
+| **ViModeCursor::motion** (末尾调用 scroll_to_point) | `alacritty_terminal/src/vi_mode.rs` | 74-186 (关键行 183) |
+| **ViModeCursor::scroll** (只算光标不滚视口) | `alacritty_terminal/src/vi_mode.rs` | 190-201 |
+| MouseScrollDelta 处理 (mouse_wheel_input) | `alacritty/src/input/mod.rs` | 725-759 |
+| scroll_terminal 四分支决策 | `alacritty/src/input/mod.rs` | 760-828 |
+| 触摸滚动 (on_touch_motion) | `alacritty/src/input/mod.rs` | 882-924 |
+| key_input 入口 | `alacritty/src/input/keyboard.rs` | 22-103 |
+| process_key_bindings | `alacritty/src/input/keyboard.rs` | 178-249 |
+| **Action::execute** (翻页/单行/顶部/底部滚动实现) | `alacritty/src/input/mod.rs` | 346-403 (纠偏重点行 374 vs 379) |
+| CenterAroundViCursor | `alacritty/src/input/mod.rs` | (ViAction 分支) |
+| **ActionContext::scroll** (完整滚动上下文) | `alacritty/src/event.rs` | 707-741 |
+| on_terminal_input_start (输入自动回底) | `alacritty/src/event.rs` | 1359-1366 |
+| update_selection_scrolling (边缘自动滚动) | `alacritty/src/input/mod.rs` | 1116-1148 |
+| **start_search (不滚动)** | `alacritty/src/event.rs` | 946-981 |
+| **update_search → goto_match** | `alacritty/src/event.rs` | 1503-1605 |
+| **goto_match (搜索跳转)** | `alacritty/src/event.rs` | 1554-1605 |
+| advance_search_origin (下一条/上一条) | `alacritty/src/event.rs` | 1132-1149 |
+| **search_reset_state (仅 Vi 模式恢复视口)** | `alacritty/src/event.rs` | 1530-1551 |
+| cancel_search (Vi vs 非 Vi 差异) | `alacritty/src/event.rs` | 1047-1063 |
+| confirm_search | `alacritty/src/event.rs` | 1030-1044 |
+| start_seeded_search | `alacritty/src/event.rs` | 984-1027 |
+| 窗口上下文搜索微调 | `alacritty/src/window_context.rs` | 554-559 |
+| Scrolling 配置 | `alacritty/src/config/scrolling.rs` | 1-53 |
