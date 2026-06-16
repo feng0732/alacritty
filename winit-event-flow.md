@@ -191,9 +191,54 @@ pub fn handle_update<T>(
 
 ---
 
-### 第三层：GL 更新 + 实际绘制
+### 第三层：GL 更新 + 实际绘制（含状态边界详析）
 
-这一层又分两步，都在 `WindowContext::draw()` 里按顺序执行。
+这一层是整个渲染管线的终点，也是状态最复杂的一层。它又分两步，都在 `WindowContext::draw()` 里按顺序执行。
+
+关键认知：**draw() 不只是"收集内容和上屏"，它是渲染记录的"消费+更新"中心**——上一帧累积的 damage、光标位置、提示高亮等渲染状态，都在这一帧被消费并轮换。
+
+---
+
+#### Step 3.0：WindowContext::draw() 入口状态清理
+
+**函数**：[window_context.rs#L366-L398](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L366-L398)
+
+进入 Display::draw() 之前，先做 4 件事：
+
+```rust
+pub fn draw(&mut self, scheduler: &mut Scheduler) {
+    // ① 清请求重绘标志（去重用）
+    self.display.window.requested_redraw = false;
+
+    // ② 窗口被遮挡 → 直接返回，不画
+    if self.occluded {
+        return;
+    }
+
+    // ③ 清 dirty 标志（本帧就是来画脏内容的）
+    self.dirty = false;
+
+    // ④ 先执行排队的 GL 更新（第二步 handle_update 排进来的）
+    self.display.process_renderer_update();
+
+    // ⑤ 视觉铃动画未结束 → 再请求一帧（连续动画）
+    if !self.display.visual_bell.completed() {
+        if self.display.window.has_frame {
+            self.display.window.request_redraw();
+        } else {
+            self.dirty = true;
+        }
+    }
+
+    // ⑥ 拿终端锁 → 调用 Display::draw()
+    let terminal = self.terminal.lock();
+    self.display.draw(terminal, scheduler, &self.message_buffer, &self.config, &mut self.search_state);
+}
+```
+
+**注意第 ⑤ 步**：`visual_bell.completed()` 不只是读取，它有副作用——如果动画已经完成，会把 `start_time` 重置为 `None`（[bell.rs#L31-L41](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/bell.rs#L31-L41)）。
+
+---
 
 #### Step 3.1：process_renderer_update——执行排队的 GL 更新
 
@@ -228,107 +273,297 @@ pub fn process_renderer_update(&mut self) {
 
 **调用时机**：在 `WindowContext::draw()` 的**最开头**，在收集渲染内容之前。
 
-**执行后**：`pending_renderer_update` 被 `take()` 消费掉，变为 `None`。
+**被消费的状态**：`pending_renderer_update` 被 `take()` 消费掉，变为 `None`。
 
-#### Step 3.2：Display::draw——收集内容 + GL 绘制 + 上屏
+**被更新的状态**：
+- `surface`（GL 绘制表面尺寸）
+- `glyph_cache`（字体纹理缓存，若 clear_font_cache）
+- `renderer`（GL uniform / 视口）
+
+---
+
+#### Step 3.2：Display::draw()——渲染状态的消费与轮换
 
 **入口**：[window_context.rs#L391](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L391)
 
 **函数**：[display/mod.rs#L775-L1047](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L775-L1047)
 
+`Display::draw()` 内部按顺序做 4 大类事，每一类都涉及特定渲染状态的消费或更新。下面逐项拆解：
+
+---
+
+##### 阶段 A：收集内容 + 消费终端脏区
+
+**代码位置**：[display/mod.rs#L783-L815](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L783-L815)
+
 ```rust
-pub fn draw<T: EventListener>(
-    &mut self,
-    mut terminal: MutexGuard<'_, Term<T>>,
-    scheduler: &mut Scheduler,
-    message_buffer: &MessageBuffer,
-    config: &UiConfig,
-    search_state: &mut SearchState,
-) {
-    // ── 阶段 A：收集渲染内容（拿终端锁，但尽快释放）──
+// ① 收集 RenderableContent（终端网格 → 可渲染单元迭代器）
+let mut content = RenderableContent::new(config, self, &terminal, search_state);
+let mut grid_cells = Vec::new();
+for cell in &mut content {
+    grid_cells.push(cell);
+}
+let selection_range = content.selection_range();
+// ...
 
-    // ① 收集 RenderableContent（终端网格 → 可渲染单元迭代器）
-    let mut content = RenderableContent::new(config, self, &terminal, search_state);
-    let mut grid_cells = Vec::new();
-    for cell in &mut content {
-        grid_cells.push(cell);
+// ② 【消费】终端 damage → 合并到帧 damage
+match terminal.damage() {
+    TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
+    TermDamage::Partial(damaged_lines) => {
+        for damage in damaged_lines {
+            self.damage_tracker.frame().damage_line(damage);
+        }
+    },
+}
+
+// ③ 【消费】终端 damage 标志 → 清空
+terminal.reset_damage();
+
+// ④ 尽早释放终端锁！（减少 I/O 线程阻塞时间）
+drop(terminal);
+```
+
+**状态流转**：
+
+| 状态 | 操作 | 位置 |
+|------|------|------|
+| `terminal.damage` | **消费**：读取 Full/Partial，逐行合并到 damage_tracker | [display/mod.rs#L804-L811](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L804-L811) |
+| `terminal.damage` | **清空**：`reset_damage()` 重置，下一帧从零开始累积 | [display/mod.rs#L812](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L812) |
+| `damage_tracker.frame()` | **更新**：累加终端 damage | 同上 |
+| `terminal` 锁 | **释放**：收集完就 drop，不再持有 | [display/mod.rs#L815](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L815) |
+
+---
+
+##### 阶段 B：校验提示高亮 + 计算本帧 damage
+
+**代码位置**：[display/mod.rs#L817-L833](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L817-L833)
+
+```rust
+// ① 【校验/可能清空】提示高亮（如果所在区域是脏的）
+self.validate_hint_highlights(display_offset);
+
+// ② UI 元素（视觉铃 / 提示 / 搜索栏）强制全 damage
+let requires_full_damage = self.visual_bell.intensity() != 0.
+    || self.hint_state.active()
+    || search_state.regex().is_some();
+if requires_full_damage {
+    self.damage_tracker.frame().mark_fully_damaged();
+    self.damage_tracker.next_frame().mark_fully_damaged();
+}
+
+// ③ 【消费+更新】Vi 光标位置 → 计算 damage（新旧位置都标记）
+self.damage_tracker.damage_vi_cursor(vi_cursor_viewport_point);
+
+// ④ 【消费+更新】选择范围 → 计算 damage（新旧范围都标记）
+self.damage_tracker.damage_selection(selection_range, display_offset);
+```
+
+**重点 1：validate_hint_highlights 做了什么**
+
+**函数**：[display/mod.rs#L1395-L1432](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L1395-L1432)
+
+这是最容易被忽略的状态更新。它检查高亮的提示（鼠标悬停 / Vi 光标）是否落在了脏区里，如果是就清除掉：
+
+```rust
+fn validate_hint_highlights(&mut self, display_offset: usize) {
+    let frame = self.damage_tracker.frame();
+    let hints = [
+        (&mut self.highlighted_hint, &mut self.highlighted_hint_age, true),     // 鼠标高亮
+        (&mut self.vi_highlighted_hint, &mut self.vi_highlighted_hint_age, false), // Vi光标高亮
+    ];
+
+    for (hint, hint_age, reset_mouse) in hints {
+        // 跳过本帧刚创建的高亮（age == 1）
+        *hint_age += 1;
+        if *hint_age == 1 { continue; }
+
+        // 高亮所在区域与本帧 damage 相交 → 清除高亮 + 全脏
+        if frame.intersects(start, end) {
+            if reset_mouse {
+                self.window.set_mouse_cursor(CursorIcon::Default);
+            }
+            frame.mark_fully_damaged();
+            *hint = None;
+        }
     }
-    // ② 收集选择范围、颜色、光标等辅助信息
-    let selection_range = content.selection_range();
-    let cursor = content.cursor();
-    // ...
-
-    // ③ 合并终端 damage 到帧 damage
-    match terminal.damage() {
-        TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
-        TermDamage::Partial(lines) => { /* 逐行 damage */ },
-    }
-    terminal.reset_damage();
-
-    // ④ 尽早释放终端锁！（减少 I/O 线程阻塞时间）
-    drop(terminal);
-
-    // ── 阶段 B：计算 damage（不再需要终端锁）──
-
-    // ⑤ UI 元素（视觉铃 / 提示 / 搜索栏）强制全 damage
-    let requires_full_damage = self.visual_bell.intensity() != 0.
-        || self.hint_state.active()
-        || search_state.regex().is_some();
-
-    // ⑥ Vi 光标 damage + 选择区域 damage
-    self.damage_tracker.damage_vi_cursor(...);
-    self.damage_tracker.damage_selection(...);
-
-    // ── 阶段 C：GL 绘制 ──
-
-    // ⑦ 激活本窗口的 GL context
-    self.make_current();
-
-    // ⑧ 清屏
-    self.renderer.clear(background_color, config.window_opacity());
-
-    // ⑨ 画文字网格
-    self.renderer.draw_cells(&size_info, glyph_cache, cells);
-
-    // ⑩ 画矩形（光标 / 下划线 / 删除线 / 视觉铃）
-    self.renderer.draw_rects(&size_info, &metrics, rects);
-
-    // ⑪ 画文字（消息栏 / 搜索栏 / 行号指示器）
-    self.renderer.draw_string(point, fg, bg, text.chars(), ...);
-
-    // ── 阶段 D：上屏 + 调度 ──
-
-    // ⑫ macOS 预备 present 通知
-    self.window.pre_present_notify();
-
-    // ⑬ swap_buffers —— 真正上屏
-    self.swap_buffers();
-
-    // ⑭ X11: renderer.finish() 消除一帧延迟
-    //     （X11 swap_buffers 不阻塞，下一条 GL 命令才阻塞）
-
-    // ⑮ 非 Wayland：调度下一帧 Frame 事件
-    if !matches!(self.raw_window_handle, Wayland(_)) {
-        self.request_frame(scheduler);
-    }
-
-    // ⑯ 轮换 damage 缓冲区（下一帧从零开始算 damage）
-    self.damage_tracker.swap_damage();
 }
 ```
 
+**为什么要这么做？** 终端内容变化后，原位置的字符/链接可能已经不存在了，高亮就无效了。通过与 damage 做相交检测，可以在内容变化时自动清除失效的高亮。
+
+**状态流转**：
+
+| 状态 | 操作 | 条件 |
+|------|------|------|
+| `highlighted_hint` | **可能被设为 None** | 所在区域是脏的且 age > 1 |
+| `vi_highlighted_hint` | **可能被设为 None** | 所在区域是脏的且 age > 1 |
+| `highlighted_hint_age` | **递增 1** | 每次 draw 都加 |
+| `vi_highlighted_hint_age` | **递增 1** | 每次 draw 都加 |
+| `damage_tracker.frame()` | **可能被标全脏** | 清除高亮时 |
+
+**重点 2：damage_vi_cursor 的"新旧交换"模式**
+
+**函数**：[damage.rs#L76-L90](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L76-L90)
+
+```rust
+pub fn damage_vi_cursor(&mut self, mut vi_cursor: Option<Point<usize>>) {
+    // 把新位置存到参数里，旧位置从 old_vi_cursor 拿出来
+    mem::swap(&mut self.old_vi_cursor, &mut vi_cursor);
+
+    // 旧位置 → 标记 damage（光标移走了，原来的位置需要重绘）
+    if let Some(vi_cursor) = self.old_vi_cursor {
+        self.frame().damage_point(vi_cursor);
+    }
+
+    // 新位置 → 标记 damage（光标到了新位置，需要重绘）
+    if let Some(vi_cursor) = vi_cursor {
+        self.frame().damage_point(vi_cursor);
+    }
+}
+```
+
+**设计模式**：DamageTracker 保存**上一帧**的光标/选择位置，每帧和新位置交换，然后把新旧位置都标脏。这样光标移动时原来的位置和新位置都会被重绘。
+
+`damage_selection` 用的是完全相同的模式（[damage.rs#L106-L135](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L106-L135)）。
+
+**状态流转**：
+
+| 状态 | 操作 |
+|------|------|
+| `damage_tracker.old_vi_cursor` | **与输入值交换**（本帧位置 → old，old → 被消费） |
+| `damage_tracker.old_selection` | **与输入值交换** |
+| `damage_tracker.frame()` | **更新**：累加新旧光标/选择的 damage |
+
+---
+
+##### 阶段 C：GL 绘制
+
+**代码位置**：[display/mod.rs#L835-L1028](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L835-L1028)
+
+```rust
+// ① 激活本窗口的 GL context
+self.make_current();
+
+// ② 清屏
+self.renderer.clear(background_color, config.window_opacity());
+
+// ③ 画文字网格（含提示高亮下划线）
+self.renderer.draw_cells(&size_info, glyph_cache, cells);
+
+// ④ 画矩形（光标 / 下划线 / 删除线 / 视觉铃 / 消息栏背景）
+self.renderer.draw_rects(&size_info, &metrics, rects);
+
+// ⑤ 画文字（消息栏文字 / 搜索栏 / 行号指示器）
+self.renderer.draw_string(point, fg, bg, text.chars(), ...);
+
+// ⑥ （调试模式）画 damage 矩形高亮
+if self.damage_tracker.debug {
+    // ...
+    self.renderer.draw_rects(&self.size_info, &metrics, rects);
+}
+```
+
+这一阶段**只消费，不更新业务状态**。所有 GL 调用都是向 GPU 发送绘制指令，不改变 CPU 侧的渲染记录。
+
+---
+
+##### 阶段 D：上屏 + 帧调度 + damage 轮换
+
+**代码位置**：[display/mod.rs#L1030-L1047](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L1030-L1047)
+
+```rust
+// ① macOS 预备 present 通知
+self.window.pre_present_notify();
+
+// ② 【上屏】swap_buffers —— 前后缓冲交换，新帧真正显示出来
+self.swap_buffers();
+
+// ③ X11: renderer.finish() 消除一帧延迟
+//    （X11 swap_buffers 不阻塞，下一条 GL 命令才阻塞）
+
+// ④ 【调度】非 Wayland：排下一帧 Frame 事件
+if !matches!(self.raw_window_handle, RawWindowHandle::Wayland(_)) {
+    self.request_frame(scheduler);
+}
+
+// ⑤ 【轮换】damage 缓冲区 —— 下一帧从零开始累积 damage
+self.damage_tracker.swap_damage();
+```
+
+**重点：swap_damage 的双缓冲机制**
+
+**函数**：[damage.rs#L58-L63](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L58-L63)
+
+```rust
+pub fn swap_damage(&mut self) {
+    let screen_lines = self.screen_lines;
+    let columns = self.columns;
+    self.frame().reset(screen_lines, columns);  // 重置当前帧（下标0）
+    self.frames.swap(0, 1);                      // 交换 0 和 1
+}
+```
+
+**双缓冲设计**：
+- `frames[0]` = 当前帧（本帧正在累积 damage 的那个）
+- `frames[1]` = 下一帧（备用）
+- `frame()` 始终返回 `&mut frames[0]`
+- `next_frame()` 返回 `&mut frames[1]`
+
+**swap_damage 做了什么**：
+1. 先重置 `frames[0]`（清成全干净状态）
+2. 交换下标 0 和 1 → 原来的 frames[1] 变成新的当前帧，原来的 frames[0] 变成备用
+
+**为什么要双缓冲？** 因为有些 UI 元素（搜索栏、视觉铃）需要**下一帧也全脏**（[display/mod.rs#L826-L827](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L826-L827)），它们通过 `next_frame()` 提前给下一帧标脏。
+
+**状态流转**：
+
+| 状态 | 操作 |
+|------|------|
+| `window.has_frame` | **设为 false**（在 request_frame 内部） |
+| `damage_tracker.frames` | **双缓冲轮换**：当前帧重置，前后台交换 |
+| `scheduler` | **新增** Frame 定时器（非 Wayland） |
+
+---
+
+#### 绘制阶段所有状态变化总表
+
+把整个第三层所有被消费/更新的状态汇总如下：
+
+| 状态 | 操作类型 | 阶段 | 代码位置 |
+|------|----------|------|----------|
+| `requested_redraw` | 清零 | 入口 | [window_context.rs#L367](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L367) |
+| `dirty` | 清零 | 入口 | [window_context.rs#L373](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L373) |
+| `pending_renderer_update` | 消费（take） | Step 3.1 | [display/mod.rs#L745](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L745) |
+| `surface` | 更新（resize） | Step 3.1 | [display/mod.rs#L753](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L753) |
+| `glyph_cache` | 重置（GL纹理） | Step 3.1 | [display/mod.rs#L761](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L761) |
+| `renderer` 视口 | 更新 | Step 3.1 | [display/mod.rs#L764](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L764) |
+| `visual_bell.start_time` | 可能清零 | 入口（completed()） | [bell.rs#L31-L41](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/bell.rs#L31-L41) |
+| `terminal.damage` | 消费 + 清零 | 阶段A | [display/mod.rs#L804-L812](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L804-L812) |
+| `terminal` 锁 | 释放 | 阶段A | [display/mod.rs#L815](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L815) |
+| `highlighted_hint` | 可能清空 | 阶段B | [display/mod.rs#L1429](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L1429) |
+| `vi_highlighted_hint` | 可能清空 | 阶段B | 同上 |
+| `highlighted_hint_age` | 递增 | 阶段B | [display/mod.rs#L1410](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L1410) |
+| `vi_highlighted_hint_age` | 递增 | 阶段B | 同上 |
+| `old_vi_cursor` | 新旧交换 | 阶段B | [damage.rs#L77](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L77) |
+| `old_selection` | 新旧交换 | 阶段B | [damage.rs#L111](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L111) |
+| `damage_tracker.frame()` | 累加 damage | 阶段A+B+C | 多处 |
+| `has_frame` | 设 false | 阶段D | [display/mod.rs#L1437](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L1437) |
+| `damage_tracker.frames` | 双缓冲轮换 | 阶段D | [damage.rs#L61-L62](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/damage.rs#L61-L62) |
+| Scheduler | 新增 Frame 定时器 | 阶段D | [display/mod.rs#L1457](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L1457) |
+
+**不改的状态（只读）**：`terminal.grid()`（内容读取）、`size_info`、`config`、`colors`、`glyph_cache`（绘制时只读，重置除外）、`metrics`。
+
+---
+
 #### draw() 的真实职责
 
-draw() 不是"只负责收集内容和上屏"，它做了四类事情：
+draw() 不是"只负责收集内容和上屏"，它是**渲染状态的一帧结算点**。可以用"三消费两更新一排"来概括：
 
-| 类别 | 内容 | 占比 |
-|------|------|------|
-| 内容收集 | RenderableContent 迭代、选择范围、光标、颜色 | 少 |
-| Damage 计算 | 终端 damage + UI damage + 光标 damage + 选择 damage | 中 |
-| GL 绘制 | clear + draw_cells + draw_rects + draw_string | 核心 |
-| 帧调度 | swap_buffers + request_frame + swap_damage | 少 |
+- **三消费**：消费终端 dirty、消费终端 damage、消费 pending_renderer_update
+- **两更新**：更新 damage tracker（含光标/选择新旧交换）、更新提示高亮校验（可能清除）
+- **一排**：排下一帧（request_frame + swap_damage）
 
-但有一条清晰的红线：**draw() 不改业务状态**（terminal、size_info、config 都是只读或加锁读）。它消费状态，产出新的一帧。
+但有一条清晰的红线：**draw() 不改业务状态**（terminal 内容、size_info、config 都是只读或加锁读）。它只消费和更新**渲染相关**的状态，产出新的一帧图像。
 
 ---
 
