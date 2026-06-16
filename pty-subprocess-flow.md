@@ -549,54 +549,128 @@ let (conin_pty_handle, conin) = miow::pipe::anonymous(0)?;
 | ⑧ 线程结束清理 | `pty.deregister(poller)` → 注销事件源 | 同左 |
 | | 线程函数返回 `(self, state)` | 同左 |
 
-#### 4.3.2 Pty 资源释放顺序（Rust Drop 行为）
+#### 4.3.2 Pty 资源释放顺序（Rust Drop 行为详解）
 
-**Rust Drop 规则**：结构体字段按**声明顺序依次 drop**（先声明的字段先被释放）。
+**Rust Drop 执行规则**：
+1. 首先执行**自定义的 `impl Drop for T`** 块（如果存在）
+2. 然后按**字段声明顺序**依次 drop 每个字段（先声明的先被释放）
+3. 这个顺序是**语言保证**的，与优化级别无关
 
-##### Unix Pty 释放顺序（[unix.rs#L309-L321](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L309-L321)）
+---
 
+##### Unix Pty 释放顺序详解
+
+**结构体字段声明**（[unix.rs#L102-L107](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L102-L107)）：
 ```rust
 pub struct Pty {
-    child: Child,          // 字段①：std::process::Child
-    file: File,            // 字段②：master 端文件
-    signals: UnixStream,   // 字段③：SIGCHLD 管道接收端
-    sig_id: SigId,         // 字段④：信号注册 ID
+    child: Child,          // 声明位置 ①
+    file: File,            // 声明位置 ②
+    signals: UnixStream,   // 声明位置 ③
+    sig_id: SigId,         // 声明位置 ④
 }
 ```
 
-| 字段顺序 | 字段 | Drop 行为 |
-|---------|------|----------|
-| (impl Drop 先执行) | — | `impl Drop for Pty` 块：`kill(SIGHUP)` → `unregister_signal(sig_id)` → `child.wait()` |
-| 字段④ | sig_id | 普通值类型，无特殊 drop |
-| 字段③ | signals | `UnixStream` drop，关闭管道 |
-| 字段② | file | `File` drop，关闭 master fd → 内核释放 PTY 资源 |
-| 字段① | child | `Child` drop，释放进程句柄 |
-
-##### Windows Pty 释放顺序（**生死攸关的顺序**，[windows/mod.rs#L27-L34](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/mod.rs#L27-L34)）
-
+**`impl Drop for Pty` 自定义逻辑**（[unix.rs#L309-L321](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L309-L321)）：
 ```rust
-pub struct Pty {
-    // XXX: Backend 必须是第一个字段，保证正确的 drop 顺序。
-    // 先 drop conout 再 drop backend 会导致死锁。
-    backend: Backend,          // 字段①：Conpty (HPCON 句柄) ← 必须第一个！
-    conout: ReadPipe,          // 字段②：UnblockedReader<AnonRead>
-    conin: WritePipe,          // 字段③：UnblockedWriter<AnonWrite>
-    child_watcher: ChildExitWatcher, // 字段④：子进程退出监视器
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // 1. 发送 SIGHUP 终止子进程
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGHUP); }
+
+        // 2. 注销 SIGCHLD 信号处理（signal_hook::low_level::unregister）
+        unregister_signal(self.sig_id);
+
+        // 3. wait 等待子进程彻底退出，回收 zombie 进程
+        let _ = self.child.wait();
+    }
 }
 ```
 
-| 字段顺序 | 字段 | Drop 行为 | 关键说明 |
-|---------|------|----------|---------|
-| 字段① | backend | `impl Drop for Conpty`：`ClosePseudoConsole(handle)` | **阻塞等待 conout 管道数据被排空**！[conpty.rs#L97-L105](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/conpty.rs#L97-L105) |
-| 字段② | conout | `UnblockedReader` drop：join 后台线程 → 关闭 `piper` pipe → 关闭 `AnonRead` 管道句柄 | **必须在 backend 之后 drop**，否则 backend 的 ClosePseudoConsole 会永远等待一个已关闭的管道 → **死锁** |
-| 字段③ | conin | `UnblockedWriter` drop：join 后台线程 → 关闭 `piper` pipe → 关闭 `AnonWrite` 管道句柄 | |
-| 字段④ | child_watcher | `impl Drop for ChildExitWatcher`：`UnregisterWait(wait_handle)` | 取消等待回调注册，释放等待句柄 |
+**完整释放时序表**（严格对齐字段声明顺序）：
 
-> **🔴 死锁警告**：如果字段顺序写反了（`conout` 放在 `backend` 前面），那么：
-> 1. `conout` 先 drop → AnonRead 管道句柄被关闭
-> 2. `backend` 后 drop → 调用 `ClosePseudoConsole()`，该函数阻塞等待 conout 管道数据排空
-> 3. 但 conout 管道句柄已经关闭，永远不会有数据写完的信号
-> 4. → 线程永久阻塞，程序无法退出
+| 阶段 | 执行顺序 | 对应字段 | 操作内容 | 代码位置 |
+|------|---------|---------|---------|---------|
+| **Phase A** | 1st | (全部字段仍存活) | 执行 `impl Drop for Pty` 块 | [unix.rs#L309-L321](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L309-L321) |
+| | ① | 读取 `child` | `kill(child.pid, SIGHUP)` → 通知子进程终止 | [unix.rs#L313](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L313) |
+| | ② | 读取 `sig_id` | `unregister_signal(sig_id)` → 从 signal-hook 全局注册表移除 SIGCHLD 回调 | [unix.rs#L317](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L317) |
+| | ③ | 读取 `child` | `child.wait()` → 阻塞等待子进程退出，内核回收进程表项（避免 zombie） | [unix.rs#L319](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L319) |
+| **Phase B** | | | 自定义 Drop 执行完毕，开始按字段声明顺序 drop | |
+| | 4th | `child` ① | `Child::drop()` → 关闭子进程句柄（释放 `ChildStdin`/`ChildStdout`/`ChildStderr` 等资源） | std::process |
+| | 5th | `file` ② | `File::drop()` → `close(master_fd)` → 关闭 PTY master 文件描述符 → 内核检测到 master 关闭后，向 slave 端的前台进程组发送 SIGHUP，并释放内核 tty 行规程缓冲区 | std::fs |
+| | 6th | `signals` ③ | `UnixStream::drop()` → `close(signals_fd)` → 关闭信号通知管道的接收端 fd → signal-hook 的发送端 fd 也会被清理 | std::os::unix::net |
+| | 7th | `sig_id` ④ | `SigId::drop()` → **注意：SigId 本身不实现 Drop**，它是一个 usize 值类型，signal 注册已在 Phase A 的 `unregister_signal()` 中手动注销 | signal_hook crate |
+
+> **设计要点**：
+> - 信号注销必须在 `child.wait()` 之前：如果先 wait，子进程退出瞬间 SIGCHLD 可能再次触发，此时管道接收端已关闭会导致 panic
+> - 自定义 Drop 块里需要 `&mut self` 访问所有字段，所以必须在字段被 drop 之前执行
+> - Unix 关闭 master fd 后，内核会自动向 slave 端的前台进程组发送 SIGHUP（这是内核的标准 PTY 行为），所以 kill(SIGHUP) 是给整个进程组发的保险
+
+---
+
+##### Windows Pty 释放顺序详解（**生死攸关的字段顺序**）
+
+**结构体字段声明**（[windows/mod.rs#L27-L34](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/mod.rs#L27-L34)）：
+```rust
+pub struct Pty {
+    // XXX: Backend is required to be the first field, to ensure correct drop order.
+    // Dropping `conout` before `backend` will cause a deadlock (with Conpty).
+    backend: Backend,          // 声明位置 ① ← 必须第一个！
+    conout: ReadPipe,          // 声明位置 ②
+    conin: WritePipe,          // 声明位置 ③
+    child_watcher: ChildExitWatcher, // 声明位置 ④
+}
+```
+
+**Pty 没有自定义 `impl Drop for Pty`，完全依赖字段声明顺序**。
+
+**完整释放时序表**（严格对齐字段声明顺序）：
+
+| 阶段 | 执行顺序 | 对应字段 | 操作内容 | 代码位置 |
+|------|---------|---------|---------|---------|
+| **Phase A** | 1st | `backend` ① | `impl Drop for Conpty` → 调用 Win32 `ClosePseudoConsole(hpc_handle)` | [conpty.rs#L97-L105](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/conpty.rs#L97-L105) |
+| | | | **关键点**：该函数会**阻塞**，直到 conout 管道中的所有数据被读取排空为止。这是微软文档规定的行为。 | |
+| **Phase B** | 2nd | `conout` ② | `impl Drop for UnblockedReader<AnonRead>` → ① 发送停止信号给后台读取线程 ② join 等待线程退出 ③ 关闭内部 `piper` pipe（释放缓冲） ④ `close(conout_handle)` → 关闭 AnonRead 管道句柄 | [blocking.rs](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/blocking.rs) |
+| **Phase C** | 3rd | `conin` ③ | `impl Drop for UnblockedWriter<AnonWrite>` → ① 发送停止信号给后台写入线程 ② join 等待线程退出 ③ 关闭内部 `piper` pipe ④ `close(conin_handle)` → 关闭 AnonWrite 管道句柄 → HPCON 收到管道断开信号，向子进程发送 Ctrl+Z 或退出信号 | 同上 |
+| **Phase D** | 4th | `child_watcher` ④ | `impl Drop for ChildExitWatcher` → 调用 Win32 `UnregisterWait(wait_handle)` → 取消 `RegisterWaitForSingleObject` 的等待回调注册，释放等待句柄 | [child.rs#L127-L133](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/child.rs#L127-L133) |
+
+**`child_watcher` 内部字段的 drop 顺序**（[child.rs#L52-L58](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/windows/child.rs#L52-L58)）：
+```rust
+pub struct ChildExitWatcher {
+    wait_handle: AtomicPtr<c_void>,  // 字段①
+    event_rx: mpsc::Receiver<...>,   // 字段②
+    interest: Arc<Mutex<Option<Interest>>>, // 字段③
+    child_handle: AtomicPtr<c_void>, // 字段④
+    pid: Option<NonZeroU32>,         // 字段⑤
+}
+```
+
+在 `impl Drop for ChildExitWatcher` 的自定义逻辑执行完后，按字段顺序继续：
+- ① `wait_handle`: AtomicPtr 无特殊 drop
+- ② `event_rx`: mpsc::Receiver drop，关闭通道接收端
+- ③ `interest`: Arc<Mutex<...>> drop，引用计数 -1，若为 0 则释放 Mutex 和 Interest
+- ④ `child_handle`: AtomicPtr 无特殊 drop（子进程句柄由 ConPTY 管理）
+- ⑤ `pid`: Option<NonZeroU32> 无特殊 drop
+
+---
+
+> **🔴 Windows 死锁警告（为什么字段顺序不能写反）**：
+>
+> 如果把 `conout` 放在 `backend` 前面（错误顺序）：
+> ```
+> 错误: conout ② → backend ①
+> ```
+> 实际执行：
+> 1. conout 先 drop → `close(conout_handle)` → 管道读端立即被关闭
+> 2. backend 后 drop → 调用 `ClosePseudoConsole()`
+> 3. 但 ClosePseudoConsole **阻塞等待** conout 管道数据被排空
+> 4. 然而 conout 管道读端已经关闭，永远不会有"数据读完"的信号
+> 5. → **线程永久阻塞，程序无法退出**
+>
+> 正确顺序 `backend ① → conout ②` 不会死锁，因为：
+> 1. backend 先 drop → ClosePseudoConsole 阻塞等待
+> 2. 此时 conout 管道句柄**仍然开放**，后台读取线程继续排空数据
+> 3. 所有数据读完 → ClosePseudoConsole 返回
+> 4. 然后 conout 再 drop，正常关闭管道
 
 ---
 
