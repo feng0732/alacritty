@@ -278,9 +278,16 @@ fn action_subparam(&mut self) {
 
 在 `next_param_or` 中，`Some(&[38, ..]) if 38 != 0` 匹配成功，取 `38`。后续子参数（2、255、0、128）需要通过 `params_iter.next()` 返回的完整切片来访问。
 
-### 2.5 中间字节（Intermediate）的超限与忽略机制
+### 2.5 私有标记字节与真正中间字节的区分
 
-中间字节是指 ESC 或 CSI 之后出现在参数之前（或参数之后）的 `0x20–0x2F` 范围内的字节（如空格、`?`、`>`、`!`、`$` 等）。
+CSI/DCS 序列中有两类特殊字节容易被混淆，它们共用 `intermediates[]` 存储但语义和状态机行为完全不同：
+
+| 分类 | 字节范围 | 典型字符 | 语义 |
+|------|---------|---------|------|
+| **真正中间字节** | `0x20–0x2F` | 空格、`!`、`"`、`#`、`$`、`%`、`'`、`(`、`)` 等 | VT 规范的中间字节，出现在参数前或参数后 |
+| **私有标记字节** | `0x3C–0x3F` | `<`、`=`、`>`、`?` | DEC 私有参数指示符，只能出现在参数**之前** |
+
+**两者都通过 `action_collect` 写入同一个 `intermediates[]` 数组**，共享 `MAX_INTERMEDIATES = 2` 的上限，但在状态机中的处理路径完全不同。
 
 #### 常量与存储
 
@@ -289,21 +296,19 @@ fn action_subparam(&mut self) {
 const MAX_INTERMEDIATES: usize = 2;
 
 pub struct Parser {
-    intermediates: [u8; MAX_INTERMEDIATES], // [u8; 2]
+    intermediates: [u8; MAX_INTERMEDIATES], // [u8; 2]，中间字节和私有标记共用
     intermediate_idx: usize,
     // ...
 }
 ```
 
-Parser 内部用固定 2 字节数组存储中间字节，通过 `intermediate_idx` 跟踪数量。
-
-#### action_collect：中间字节累积
+#### action_collect：两类字节的共同入口
 
 ```rust
 // vte/src/lib.rs
 fn action_collect(&mut self, byte: u8) {
     if self.intermediate_idx == MAX_INTERMEDIATES {
-        self.ignoring = true;     // ← 第三个及之后的中间字节触发忽略
+        self.ignoring = true;     // ← 第三次及之后 collect 触发忽略
     } else {
         self.intermediates[self.intermediate_idx] = byte;
         self.intermediate_idx += 1;
@@ -311,52 +316,150 @@ fn action_collect(&mut self, byte: u8) {
 }
 ```
 
-`action_collect` 在以下状态收到 `0x20–0x2F` 字节时被调用：
-- `EscapeIntermediate`
-- `CsiIntermediate`
-- `DcsIntermediate`
-- `CsiParam`（收到 `0x20–0x2F` 时先 `action_collect`，再转入 `CsiIntermediate`）
-- `DcsParam`（收到 `0x20–0x2F` 时先 `action_collect`，再转入 `DcsIntermediate`）
+无论是 `0x20–0x2F` 还是 `0x3C–0x3F`，只要被 `action_collect` 处理，就写入同一个数组。超限后统一设 `ignoring = true`。
 
-#### CsiIgnore 状态：参数/中间字节非法后的静默吞掉
+#### 状态相关行为：同一字节在不同状态下命运完全不同
 
-如果中间字节超限后，在 `CsiIntermediate` 状态下又收到参数字节（`0x30–0x3F`），Parser 转入 `CsiIgnore` 状态：
+以 `?`（0x3F）为例，它在不同 CSI 状态下的处理：
+
+**`CsiEntry` 状态**（刚收到 `ESC [`，尚未收到任何参数或中间字节）：
 
 ```rust
-// vte/src/lib.rs
-fn advance_csi_intermediate(&mut self, performer, byte: u8) {
+// vte/src/lib.rs:187
+fn advance_csi_entry<P: Perform>(&mut self, performer: &mut P, byte: u8) {
     match byte {
-        0x20..=0x2F => self.action_collect(byte),
-        0x30..=0x3F => self.state = State::CsiIgnore,  // ← 参数出现在中间字节之后→忽略
+        0x20..=0x2F => {
+            self.action_collect(byte);
+            self.state = State::CsiIntermediate   // 真正中间字节 → CsiIntermediate
+        },
+        0x30..=0x39 => {
+            self.action_paramnext(byte);
+            self.state = State::CsiParam
+        },
+        0x3A => {
+            self.action_subparam();
+            self.state = State::CsiParam
+        },
+        0x3B => {
+            self.action_param();
+            self.state = State::CsiParam
+        },
+        0x3C..=0x3F => {
+            self.action_collect(byte);              // 私有标记字节 → action_collect
+            self.state = State::CsiParam            // 然后转入 CsiParam（不是 CsiIgnore！）
+        },
         0x40..=0x7E => self.action_csi_dispatch(performer, byte),
         // ...
     }
 }
 ```
 
-同理，`CsiParam` 状态下收到 `0x3C–0x3F`（`< = > ?` 中除了 `0x3A = ':'` 和 `0x3B = ';'` 之外的 4 个字节）也会转入 `CsiIgnore`：
+**关键**：`0x3C–0x3F` 在 `CsiEntry` 中是合法的！它们通过 `action_collect` 存入 `intermediates[]`，然后转入 `CsiParam`（因为私有标记后面通常跟数字参数）。这就是 `CSI ?2026h` 能正常工作的原因。
+
+**`CsiParam` 状态**（已经收到过数字参数）：
 
 ```rust
-fn advance_csi_param(&mut self, performer, byte: u8) {
+// vte/src/lib.rs:238
+fn advance_csi_param<P: Perform>(&mut self, performer: &mut P, byte: u8) {
     match byte {
+        0x20..=0x2F => {
+            self.action_collect(byte);              // 真正中间字节仍然合法
+            self.state = State::CsiIntermediate
+        },
         0x30..=0x39 => self.action_paramnext(byte),
-        0x3A       => self.action_subparam(),
-        0x3B       => self.action_param(),
-        0x3C..=0x3F => self.state = State::CsiIgnore,  // ← < = > ? 出现在参数位置
+        0x3A => self.action_subparam(),
+        0x3B => self.action_param(),
+        0x3C..=0x3F => self.state = State::CsiIgnore,  // 私有标记出现在参数之后→非法！
         0x40..=0x7E => self.action_csi_dispatch(performer, byte),
         // ...
     }
 }
+```
+
+**关键**：同样的 `0x3C–0x3F`，在 `CsiParam` 中转入 `CsiIgnore`——私有标记**只能在参数之前出现**，参数之后出现则整个序列被丢弃。
+
+**`CsiIntermediate` 状态**（已经收到过中间字节）：
+
+```rust
+// vte/src/lib.rs:227
+fn advance_csi_intermediate<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    match byte {
+        0x20..=0x2F => self.action_collect(byte),          // 继续累积中间字节
+        0x30..=0x3F => self.state = State::CsiIgnore,      // 任何非中间字节→忽略
+        0x40..=0x7E => self.action_csi_dispatch(performer, byte),
+        // ...
+    }
+}
+```
+
+**关键**：`CsiIntermediate` 中，`0x30–0x3F` **全部**转入 `CsiIgnore`（包括数字和私有标记），因为中间字节之后只允许更多中间字节或终结字节。
+
+#### 完整的状态 × 字节行为表
+
+| 字节范围 | CsiEntry | CsiParam | CsiIntermediate | CsiIgnore |
+|---------|----------|----------|-----------------|-----------|
+| `0x20–0x2F`（真正中间字节） | `action_collect` → CsiIntermediate | `action_collect` → CsiIntermediate | `action_collect` | 静默丢弃 |
+| `0x30–0x39`（数字） | `action_paramnext` → CsiParam | `action_paramnext` | → **CsiIgnore** | 静默丢弃 |
+| `0x3A`（`:`） | `action_subparam` → CsiParam | `action_subparam` | → **CsiIgnore** | 静默丢弃 |
+| `0x3B`（`;`） | `action_param` → CsiParam | `action_param` | → **CsiIgnore** | 静默丢弃 |
+| `0x3C–0x3F`（`< = > ?`） | `action_collect` → **CsiParam** ✅ | → **CsiIgnore** ❌ | → **CsiIgnore** ❌ | 静默丢弃 |
+| `0x40–0x7E`（终结字节） | `action_csi_dispatch` | `action_csi_dispatch` | `action_csi_dispatch` | → Ground（不 dispatch） |
+
+**核心规则**：
+- 私有标记 `0x3C–0x3F` **只在 `CsiEntry` 中合法**——它们必须紧跟在 `ESC [` 之后、任何数字参数之前
+- 真正中间字节 `0x20–0x2F` 在 `CsiEntry`、`CsiParam`、`CsiIntermediate` 中都合法
+- 一旦进入 `CsiIntermediate`，除了更多中间字节和终结字节，**一切**都导致 `CsiIgnore`
+
+#### 实例对比
+
+**合法**：`CSI ?25h`（显示光标）
+
+```
+CsiEntry:
+  0x3F '?' → action_collect(0x3F), intermediates=[0x3F], state=CsiParam
+CsiParam:
+  0x32 '2' → action_paramnext, param=2
+  0x35 '5' → action_paramnext, param=25
+  0x68 'h' → action_csi_dispatch
+→ csi_dispatch(params=[25], intermediates=[0x3F], ignore=false, action='h')
+→ Performer 匹配 ('h', [b'?']) → set_private_mode(ShowCursor)
+```
+
+**非法**：`CSI 25?h`（参数之后的 `?`）
+
+```
+CsiEntry:
+  0x32 '2' → action_paramnext, param=2, state=CsiParam
+CsiParam:
+  0x35 '5' → action_paramnext, param=25
+  0x3F '?' → state=CsiIgnore    ← 参数之后出现私有标记→忽略！
+CsiIgnore:
+  0x68 'h' → state=Ground       ← 终结字节，回到 Ground，不 dispatch
+→ 整个序列被丢弃
+```
+
+**合法**：`CSI ?1$m`（虽然 vte 无对应 Handler，但解析路径合法）
+
+```
+CsiEntry:
+  0x3F '?' → action_collect(0x3F), intermediates=[0x3F], state=CsiParam
+CsiParam:
+  0x31 '1' → action_paramnext, param=1
+  0x24 '$' → action_collect(0x24), intermediates=[0x3F,0x24], state=CsiIntermediate
+CsiIntermediate:
+  0x6D 'm' → action_csi_dispatch
+→ csi_dispatch(params=[1], intermediates=[0x3F,0x24], ignore=false, action='m')
+→ Performer 无匹配 → unhandled!()
 ```
 
 #### CsiIgnore 态的处理
 
 ```rust
-// vte/src/lib.rs
-fn advance_csi_ignore(&mut self, performer, byte: u8) {
+// vte/src/lib.rs:216
+fn advance_csi_ignore<P: Perform>(&mut self, performer: &mut P, byte: u8) {
     match byte {
         0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte), // C0 控制仍执行
-        0x20..=0x3F => (),       // 参数/中间字节静默丢弃
+        0x20..=0x3F => (),       // 中间字节/参数/私有标记全部静默丢弃
         0x40..=0x7E => self.state = State::Ground, // 终结字节：回 Ground，**不 dispatch**
         0x7F => (),              // DEL 忽略
         _ => self.anywhere(performer, byte),        // CAN/SUB/ESC 等全局处理
@@ -364,16 +467,15 @@ fn advance_csi_ignore(&mut self, performer, byte: u8) {
 }
 ```
 
-**关键差异**：在 `CsiParam` / `CsiIntermediate` 态下，`0x40–0x7E` 会触发 `action_csi_dispatch`（调用 `performer.csi_dispatch`），但在 `CsiIgnore` 态下**只回 Ground、不 dispatch**——整个 CSI 序列被彻底丢弃。
-
-所以中间字节超限有两条丢弃路径：
+#### 丢弃路径总结
 
 | 路径 | 触发条件 | 丢弃位置 |
 |------|---------|---------|
-| 1 | 中间字节 ≥ 3 个（`action_collect` 设 `ignoring=true`），最终走到 `0x40–0x7E` | Performer.csi_dispatch 入口：`if has_ignored_intermediates { return; }` |
-| 2 | `CsiIntermediate` 收到 `0x30–0x3F` 或 `CsiParam` 收到 `0x3C–0x3F` → `CsiIgnore` | `advance_csi_ignore` 中对 `0x40–0x7E` 只回 Ground，**完全不调用** `csi_dispatch` |
+| 1 | `action_collect` 超过 2 次（`ignoring=true`），最终走到终结字节 `0x40–0x7E` | `action_csi_dispatch` 仍被调用 → Performer.csi_dispatch：`if has_ignored_intermediates { return; }` |
+| 2 | `CsiParam` 收到 `0x3C–0x3F`（私有标记出现在参数之后）→ `CsiIgnore` | `advance_csi_ignore` 中终结字节只回 Ground，**完全不调用** `csi_dispatch` |
+| 3 | `CsiIntermediate` 收到 `0x30–0x3F`（数字或私有标记出现在中间字节之后）→ `CsiIgnore` | 同上 |
 
-DCS 序列（`DcsIntermediate` / `DcsParam` / `DcsIgnore`）遵循完全相同的逻辑。
+DCS 序列（`DcsEntry` / `DcsParam` / `DcsIntermediate` / `DcsIgnore`）遵循完全相同的状态机逻辑，其中 `DcsEntry` 对 `0x3C–0x3F` 同样是 `action_collect` → `DcsParam`。
 
 ---
 

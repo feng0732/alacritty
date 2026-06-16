@@ -365,20 +365,19 @@ fn action_csi_dispatch(&mut self, performer, byte) {
 }
 ```
 
-### 6.2 Parser 层：中间字节超限 → CsiIgnore / DcsIgnore
+### 6.2 Parser 层：私有标记与中间字节的 Ignore 机制
 
-当中间字节超过 `MAX_INTERMEDIATES=2` 时，`action_collect` 设置 `ignoring=true`，后续在 CSI 中若再收到参数字节则转入 `CsiIgnore` 状态：
+CSI/DCS 中有两类字节通过 `action_collect` 写入 `intermediates[]`：
+- **真正中间字节** `0x20–0x2F`（空格、`!`、`#`、`$` 等）
+- **私有标记字节** `0x3C–0x3F`（`<`、`=`、`>`、`?`）
 
-```rust
-fn advance_csi_intermediate(performer, byte) {
-    match byte {
-        0x30..=0x3F => self.state = State::CsiIgnore,  // 参数出现在中间字节后→忽略
-        ...
-    }
-}
-```
+两者共用 `MAX_INTERMEDIATES=2` 的上限，超限设 `ignoring=true`。但状态机行为不同：
 
-`CsiIgnore` 态下所有字节被静默吞掉，直到终结字节 (0x40-0x7E) 才回到 Ground。
+- 在 `CsiEntry`：`0x3C–0x3F` 合法，`action_collect` 后转入 `CsiParam`（如 `CSI ?25h`）
+- 在 `CsiParam`：`0x3C–0x3F` 非法，直接转入 `CsiIgnore`（私有标记不能出现在参数之后）
+- 在 `CsiIntermediate`：`0x30–0x3F` 全部转入 `CsiIgnore`（中间字节后只允许更多中间字节或终结字节）
+
+`CsiIgnore` 态下所有字节被静默吞掉，直到终结字节 (0x40-0x7E) 才回到 Ground，且**不调用 csi_dispatch**。
 
 ### 6.3 Parser 层：`anywhere` 处理 — 紧急重置
 
