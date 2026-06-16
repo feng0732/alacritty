@@ -574,7 +574,7 @@ pub struct Pty {
 ```rust
 impl Drop for Pty {
     fn drop(&mut self) {
-        // 1. 发送 SIGHUP 终止子进程
+        // 1. 向子进程发送 SIGHUP
         unsafe { libc::kill(self.child.id() as i32, libc::SIGHUP); }
 
         // 2. 注销 SIGCHLD 信号处理（signal_hook::low_level::unregister）
@@ -591,7 +591,7 @@ impl Drop for Pty {
 | 阶段 | 执行顺序 | 对应字段 | 操作内容 | 代码位置 |
 |------|---------|---------|---------|---------|
 | **Phase A** | 1st | (全部字段仍存活) | 执行 `impl Drop for Pty` 块 | [unix.rs#L309-L321](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L309-L321) |
-| | ① | 读取 `child` | `kill(child.pid, SIGHUP)` → 通知子进程终止 | [unix.rs#L313](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L313) |
+| | ① | 读取 `child` | `kill(child.pid, SIGHUP)` → 向子进程本身发送 SIGHUP | [unix.rs#L313](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L313) |
 | | ② | 读取 `sig_id` | `unregister_signal(sig_id)` → 从 signal-hook 全局注册表移除 SIGCHLD 回调 | [unix.rs#L317](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L317) |
 | | ③ | 读取 `child` | `child.wait()` → 阻塞等待子进程退出，内核回收进程表项（避免 zombie） | [unix.rs#L319](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L319) |
 | **Phase B** | | | 自定义 Drop 执行完毕，开始按字段声明顺序 drop | |
@@ -603,7 +603,71 @@ impl Drop for Pty {
 > **设计要点**：
 > - 信号注销必须在 `child.wait()` 之前：如果先 wait，子进程退出瞬间 SIGCHLD 可能再次触发，此时管道接收端已关闭会导致 panic
 > - 自定义 Drop 块里需要 `&mut self` 访问所有字段，所以必须在字段被 drop 之前执行
-> - Unix 关闭 master fd 后，内核会自动向 slave 端的前台进程组发送 SIGHUP（这是内核的标准 PTY 行为），所以 kill(SIGHUP) 是给整个进程组发的保险
+
+#### 4.3.3 Unix 退出机制的四层行为辨析
+
+代码中涉及四种不同的"让子进程退出"的机制，必须严格区分：
+
+**① 主动发送信号：`libc::kill(child.pid, SIGHUP)`**
+
+- **代码位置**：[unix.rs#L313](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L313)
+- **参数语义**：`self.child.id()` 返回的是子进程的 **PID**（正整数），**不是**进程组 ID
+- **`kill(pid, sig)` 对正数 pid 的行为**：仅发送信号给 **PID 等于该值的单个进程**，不会发给进程组
+- **注意**：虽然子进程在 pre_exec 中调用了 `setsid()`（[unix.rs#L251](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L251)），导致 PID == PGID == SID，但 `kill(正数, sig)` 永远只发给该进程本身
+- **如果要发给整个进程组**，需要用 `kill(-pgid, sig)`（负数参数），代码中没有这样做
+- **效果**：只有 shell 主进程收到 SIGHUP。shell 自身的 SIGHUP handler 通常会再把信号转发给其子进程组，但这是 shell 的行为，不是 `kill()` 的行为
+
+**② 关闭 master fd：内核向 slave 前台进程组发 SIGHUP**
+
+- **代码位置**：Phase B 第 5 步，`File::drop()` → `close(master_fd)`
+- **触发条件**：PTY master 端的最后一个文件描述符被关闭
+- **内核行为**（POSIX 规定）：
+  1. 内核检测到 master 端无引用 → 标记该 PTY 设备为"挂断"
+  2. 内核向 **slave 端的前台进程组** 发送 `SIGHUP` 信号
+  3. 随后发送 `SIGCONT`（确保被停止的进程也能收到 SIGHUP）
+  4. 释放内核中该 PTY 的 tty 行规程缓冲区等资源
+- **关键区别**：这是**内核**发出的信号，目标是**整个前台进程组**，与①中 `kill(pid)` 只发给单个进程不同
+
+**③ `child.wait()`：回收 zombie 进程**
+
+- **代码位置**：[unix.rs#L319](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L319)
+- **功能**：阻塞等待子进程退出，调用 `waitpid(child.pid)` → 内核回收进程表项
+- **与信号无关**：它不发信号，只负责"收尸"
+- **为什么要做**：如果父进程不 wait，子进程退出后会变成 zombie（占用 PID 和内核进程表项），直到父进程退出才被 init 进程回收
+- **时序保证**：wait 在 SIGHUP 发送之后执行，确保信号已送达
+
+**④ 内核 tty 行规程对 close(slave_fd) 的处理（在 pre_exec 中已完成）**
+
+- **代码位置**：[unix.rs#L264](file:///d:/fz/0601/solo-dogfeeding/code/339-alacritty/alacritty_terminal/src/tty/unix.rs#L264) `libc::close(slave_fd)`
+- **这是子进程启动阶段的操作**，不是退出阶段的操作
+- 子进程在 pre_exec 中 close(slave_fd) 后，slave 端只剩内核 tty 行规程持有的引用
+- 当 master 端关闭时，内核会清理 slave 端的所有状态
+
+**四层机制的时序关系图**：
+
+```
+impl Drop for Pty {                    字段 drop 阶段
+─────────────────────                  ─────────────────
+① kill(pid, SIGHUP)  ─── 发给子进程本身（单个进程）
+    │
+② unregister_signal  ─── 清理信号注册
+    │
+③ child.wait()       ─── 阻塞等子进程退出
+    │                 （子进程收到①的 SIGHUP 后退出）
+    ↓
+字段按序 drop:
+    child ① ─── 释放进程句柄
+    file   ② ─── close(master_fd)
+                   │
+                   └──→ 内核：master 无引用
+                        ├── 向 slave 前台进程组发 SIGHUP  ← ④ 内核行为
+                        ├── 释放 tty 行规程缓冲区
+                        └── 标记 PTY 设备为已销毁
+    signals③ ─── close(信号管道)
+    sig_id ④ ─── 值类型，无 drop
+```
+
+> **重要澄清**：代码中的 `kill(pid, SIGHUP)` 发给的是**子进程本身（PID）**，不是进程组。但因为子进程是 session leader（`setsid()` 创建了新 session），当它收到 SIGHUP 退出时，通常 shell 会将其子进程也一并清理。如果 shell 没有处理 SIGHUP（或忽略了），其子进程可能会变成孤儿进程被 init 接管。而在 Phase B 关闭 master fd 后，内核**额外**向整个前台进程组再发一次 SIGHUP，这就覆盖了 shell 的子进程。所以两个 SIGHUP 的目标不同：① 给 shell 本身，④ 给整个前台进程组。
 
 ---
 
