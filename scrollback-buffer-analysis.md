@@ -1053,36 +1053,198 @@ fn start_seeded_search(&mut self, direction: Direction, text: String) {
 
 #### 5.10.5 SearchAction 搜索模式内操作
 
-这些是在搜索输入框激活时（`BindingMode::SEARCH`）的操作：
+这些是在搜索输入框激活时（`BindingMode::SEARCH`）的操作。
 
-| 动作 | 默认绑定 | 是否滚动视口 | 代码行为 |
-|------|---------|-------------|---------|
-| `SearchAction::SearchFocusNext` | `Enter`（搜索模式，非 Vi） | ✅ **是** | `ctx.advance_search_origin(ctx.search_direction())` → 先 `scroll_to_point(new_origin)` 对齐，再 `goto_match(None)` 无限制查找。 |
-| `SearchAction::SearchFocusPrevious` | `Shift-Enter`（搜索模式，非 Vi） | ✅ **是** | 同上，方向相反。 |
-| `SearchAction::SearchConfirm` | `Enter`（搜索模式，Vi） | ⚠️ 仅无结果时可能 | Vi 模式：取消延迟搜索 → `goto_match(None)` 无结果则 `search_reset_state`（恢复视口）；非 Vi 模式：直接 `cancel_search()` → 创建选区，不滚动。 |
-| `SearchAction::SearchCancel` | `Esc`（搜索模式） | ⚠️ 仅 Vi 模式 | Vi 模式：`search_reset_state` 恢复视口和光标；非 Vi 模式：创建选区，停留在匹配处，不滚动。 |
-| `SearchAction::SearchClear` | （无默认） | ⚠️ 取决于后续 | 调用 `cancel_search()` → `start_search(direction)`。是否滚动取决于取消时的操作。 |
-| `SearchAction::SearchDeleteWord` | `Ctrl-W`（搜索模式） | ⚠️ 取决于匹配 | 只删除搜索词的最后一个词 → 调用 `update_search()` → `goto_match()`，找到匹配则滚动。 |
-| `SearchAction::SearchHistoryPrevious` | `Up`（搜索模式） | ⚠️ 取决于匹配 | 切换到上一个历史搜索词 → `update_search()` → `goto_match()`。 |
-| `SearchAction::SearchHistoryNext` | `Down`（搜索模式） | ⚠️ 取决于匹配 | 切换到下一个历史搜索词 → 同上。 |
+先理解延迟搜索机制：用户快速输入搜索词时，`goto_match(limit=1000)` 只搜索 1000 行。如果没找到匹配，会调度一个 500ms 后触发的 `EventType::SearchNext` 定时器，定时器到期后执行 `goto_match(None)`（无限制搜索）。在这个窗口期内如果用户继续输入，定时器会被重置。
 
-**`advance_search_origin` 实现**（`event.rs:1132`）：
+```
+用户输入字符 → update_search()
+                    ↓
+         goto_match(limit=1000)
+              ┌─────┼─────┐
+              ▼     ▼     ▼
+         找到匹配  没找到  超出限制
+           ↓       ↓       ↓
+      滚动+高亮  清空焦点  调度 SearchNext 定时器（500ms）
+                            ↓ 等待期间用户继续输入 → 重置定时器
+                            ↓ 500ms 无输入 → goto_match(None)
+                                ┌─────┼─────┐
+                                ▼     ▼
+                           找到匹配  没找到
+                              ↓       ↓
+                         滚动+高亮  search_reset_state()
+                                   (Vi 模式恢复视口)
+```
+
+**以下是各 SearchAction 的完整行为分析：**
+
+##### `SearchConfirm`（Enter 键确认搜索）
+
+代码路径（`event.rs:1030`）：
+
+```rust
+fn confirm_search(&mut self) {
+    if !self.terminal.mode().contains(TermMode::VI) {
+        self.cancel_search();  // ← 非 Vi 直接走取消逻辑
+        return;
+    }
+
+    // Vi 模式：如果有延迟搜索定时器（上次搜索超限没找完），先完成一次无限制搜索
+    let timer_id = TimerId::new(Topic::DelayedSearch, self.display.window.id());
+    if self.scheduler.scheduled(timer_id) {
+        self.goto_match(None);  // ← 关键：可能触发滚动或视口恢复
+    }
+
+    self.exit_search();  // 清理搜索状态，不滚动
+}
+```
+
+| 模式 | 延迟搜索状态 | 是否滚动视口 | 完整行为 |
+|------|------------|-------------|---------|
+| **Vi** | 无延迟搜索 | ❌ **否** | 直接 `exit_search()`，视口和光标保持当前状态（已跳转到某匹配上） |
+| **Vi** | 有延迟搜索 → `goto_match(None)` 找到匹配 | ✅ **是** | `vi_goto_point` → `scroll_to_point` 滚动到新匹配 |
+| **Vi** | 有延迟搜索 → `goto_match(None)` 没找到 | ✅ **是** | `search_reset_state()` 恢复视口和光标到搜索前位置 |
+| **非 Vi** | 任意 | ❌ **否** | 等价于 `cancel_search()`：有匹配则创建选区（不滚），无匹配则什么都不做 |
+
+**此前偏差**：误将 Vi 模式 SearchConfirm 归为"仅无结果时可能滚动"。实际上，当有延迟搜索时 **找到匹配也会滚动**（跳转到新匹配位置），且 `exit_search()` 本身不会恢复视口——只有 `goto_match(None)` 没找到时才通过 `search_reset_state` 恢复。
+
+##### `SearchCancel`（Esc 键取消搜索）
+
+代码路径（`event.rs:1047`）：
+
+```rust
+fn cancel_search(&mut self) {
+    if self.terminal.mode().contains(TermMode::VI) {
+        self.search_reset_state();  // ← 恢复视口和光标
+    } else if let Some(focused_match) = &self.search_state.focused_match {
+        // 非 Vi：创建选区（不滚动）
+        self.start_selection(SelectionType::Simple, *focused_match.start(), Side::Left);
+        self.update_selection(*focused_match.end(), Side::Right);
+        self.copy_selection(ClipboardType::Selection);
+    }
+    // 非 Vi 且无匹配：什么都不做
+
+    self.search_state.dfas = None;
+    self.exit_search();
+}
+```
+
+| 模式 | 是否有匹配 | 是否滚动视口 | 完整行为 |
+|------|----------|-------------|---------|
+| **Vi** | 任意 | ✅ **是** | `search_reset_state` → `scroll_display(Delta(display_offset_delta))` 恢复视口到搜索前位置 + 恢复 vi 光标 |
+| **非 Vi** | 有匹配 | ❌ **否** | 创建选区覆盖匹配范围，复制到选区剪贴板，视口停留在匹配位置 |
+| **非 Vi** | 无匹配 | ❌ **否** | 什么都不做，视口保持原样 |
+
+注意：`search_reset_state` 在 Vi 模式下**始终**恢复视口，无论是否有延迟搜索、是否有匹配。它用 `display_offset_delta` 回滚所有搜索期间的视口偏移。
+
+##### `SearchFocusNext` / `SearchFocusPrevious`（Enter / Shift-Enter 聚焦跳转）
+
+代码路径（`input/mod.rs:303` → `event.rs:1132`）：
 
 ```rust
 fn advance_search_origin(&mut self, direction: Direction) {
+    // 阶段 1：如果有当前聚焦匹配，从匹配边缘开始搜索
     if let Some(focused_match) = &self.search_state.focused_match {
-        let new_origin = match direction { /* 从当前匹配后开始 */ };
-        // ✅ 先对齐到当前匹配（如果不在视口内，先滚回来）
+        let new_origin = match direction {
+            Direction::Right => focused_match.end().add(self.terminal, Boundary::None, 1),
+            Direction::Left => focused_match.start().sub(self.terminal, Boundary::None, 1),
+        };
+        // ✅ 先滚动到 origin（确保搜索起点在视口内）
         self.terminal.scroll_to_point(new_origin);
-        self.search_state.display_offset_delta = 0;
+        self.search_state.display_offset_delta = 0;  // 重置偏移计数
         self.search_state.origin = new_origin;
     }
-    // ✅ 再跳到下一条（无限制查找，可能滚动很远）
+
+    // 阶段 2：无限制搜索下一条
     let search_direction = mem::replace(&mut self.search_state.direction, direction);
-    self.goto_match(None);
+    self.goto_match(None);  // ← 无限制搜索，可能滚动很远
     self.search_state.direction = search_direction;
+
+    // 阶段 3：如果找到匹配，重新对齐 origin 和 display_offset_delta
+    let focused_match = match &self.search_state.focused_match {
+        Some(focused_match) => focused_match,
+        None => return,  // 没找到匹配，直接返回（此时 goto_match 已调用 search_reset_state）
+    };
+    let new_origin = match self.search_state.direction {
+        Direction::Right => *focused_match.start(),
+        Direction::Left => *focused_match.end(),
+    };
+    // 计算从当前位置到匹配的滚动距离
+    let old_display_offset = self.terminal.grid().display_offset() as i32;
+    self.terminal.scroll_to_point(new_origin);
+    let new_display_offset = self.terminal.grid().display_offset() as i32;
+    self.search_state.display_offset_delta = new_display_offset - old_display_offset;
+
+    // 滚回匹配位置（scroll_to_point 可能因对齐需要多滚了一点）
+    self.terminal.scroll_display(Scroll::Delta(-self.search_state.display_offset_delta));
+    self.search_state.origin = new_origin;
 }
 ```
+
+| 场景 | 是否滚动视口 | 说明 |
+|------|-------------|------|
+| 有聚焦匹配 → 找到下一条 | ✅ **是** | 阶段 1 `scroll_to_point` 对齐 + 阶段 2 `goto_match(None)` 跳转 + 阶段 3 对齐修正 |
+| 有聚焦匹配 → 没找到下一条（Vi 模式） | ✅ **是** | `goto_match(None)` 没找到 → `search_reset_state()` 恢复视口 |
+| 有聚焦匹配 → 没找到下一条（非 Vi 模式） | ✅ **是** | 阶段 1 的 `scroll_to_point` 已经滚动了视口（但 `search_reset_state` 非 Vi 下不恢复） |
+| 无聚焦匹配 → 找到 | ✅ **是** | 跳过阶段 1，直接 `goto_match(None)` |
+| 无聚焦匹配 → 没找到（Vi 模式） | ⚠️ 可能 | `goto_match(None)` → `search_reset_state` 恢复视口（如果搜索期间视口变了，恢复就是滚动） |
+| 无聚焦匹配 → 没找到（非 Vi 模式） | ❌ **否** | 跳过阶段 1，`goto_match(None)` 没找到不调用 `search_reset_state`（非 Vi 直接 return），视口不变 |
+
+##### `SearchClear`（清空搜索词）
+
+代码路径（`input/mod.rs:312`）：
+
+```rust
+Action::Search(SearchAction::SearchClear) => {
+    let direction = ctx.search_direction();
+    ctx.cancel_search();    // ← 先取消（Vi 模式恢复视口，非 Vi 创建选区）
+    ctx.start_search(direction);  // ← 重新开始（只设 origin，不滚动）
+},
+```
+
+| 模式 | 是否滚动视口 | 说明 |
+|------|-------------|------|
+| **Vi** | ✅ **是** | `cancel_search` → `search_reset_state` 恢复视口；然后 `start_search` 不滚动 |
+| **非 Vi**，有匹配 | ❌ **否** | `cancel_search` 创建选区（视口停在匹配处）；`start_search` 不滚动 |
+| **非 Vi**，无匹配 | ❌ **否** | `cancel_search` 什么都不做；`start_search` 不滚动 |
+
+##### `SearchDeleteWord` / `SearchHistoryPrevious` / `SearchHistoryNext`
+
+三者都只修改搜索词，然后调用 `update_search()`：
+
+```rust
+fn search_pop_word(&mut self) {
+    if let Some(regex) = self.search_state.regex_mut() {
+        *regex = regex.trim_end().to_owned();
+        regex.truncate(regex.rfind(' ').map_or(0, |i| i + 1));
+        self.update_search();  // ← 可能触发滚动
+    }
+}
+
+fn search_history_previous(&mut self) { /* ... */ self.update_search(); }
+fn search_history_next(&mut self) { /* ... */ self.update_search(); }
+```
+
+`update_search()` 调用 `goto_match(limit=1000)`，滚动行为取决于匹配结果：
+
+| 匹配结果 | Vi 模式滚动 | 非 Vi 模式滚动 |
+|---------|------------|---------------|
+| 找到匹配 | ✅ `vi_goto_point` → `scroll_to_point` | ✅ `scroll_to_point`（仅视口对齐，不设光标） |
+| 没找到（有限搜索） | ❌ 调度延迟搜索定时器，清空焦点，不滚动 | ❌ 同左 |
+| 没找到（无限搜索） | ✅ `search_reset_state` 恢复视口 | ❌ 非 Vi `search_reset_state` 不恢复 |
+
+##### SearchAction 完整滚动行为汇总
+
+| 动作 | Vi 模式 | 非 Vi 模式 |
+|------|--------|-----------|
+| **SearchConfirm** | 有延迟搜索 → `goto_match(None)`：找到✅滚动 / 没找到✅恢复视口；无延迟搜索 → ❌不滚 | ❌ 等价 cancel：创建选区不滚 / 无操作 |
+| **SearchCancel** | ✅ `search_reset_state` 始终恢复视口 | ❌ 创建选区不滚 / 无操作 |
+| **SearchFocusNext** | 有匹配✅跳转 / 没匹配✅恢复视口 | 有匹配✅跳转 / 没匹配❌不滚 |
+| **SearchFocusPrevious** | 同上 | 同上 |
+| **SearchClear** | ✅ cancel 恢复视口 | ❌ cancel 创建选区不滚 |
+| **SearchDeleteWord** | 找到✅ / 没找到有限❌ / 没找到无限✅恢复 | 找到✅ / 没找到❌ |
+| **SearchHistoryPrevious** | 同上 | 同上 |
+| **SearchHistoryNext** | 同上 | 同上 |
 
 #### 5.10.6 行内搜索与普通搜索的滚动入口对比
 
@@ -1097,32 +1259,37 @@ fn advance_search_origin(&mut self, direction: Direction) {
 
 #### 5.10.7 所有搜索相关动作滚动行为汇总表
 
-| 层级 | 动作 | 是否触发视口滚动 | 滚动触发点 |
-|------|------|-----------------|-----------|
-| **顶层 Action** | `SearchForward` | ⚠️ 启动不滚；输入时可能滚 | `update_search` → `goto_match` |
-| | `SearchBackward` | ⚠️ 同上 | 同上 |
-| **ViAction** | `SearchNext` | ✅ **是** | `vi_goto_point` → `scroll_to_point` |
-| | `SearchPrevious` | ✅ **是** | 同上 |
-| | `SearchStart` | ✅ **是** | 同上 |
-| | `SearchEnd` | ✅ **是** | 同上 |
-| | `InlineSearchForward` | ⚠️ 启动不滚；输入后可能滚 | `inline_search` → `vi_goto_point` |
-| | `InlineSearchBackward` | ⚠️ 同上 | 同上 |
-| | `InlineSearchForwardShort` | ⚠️ 同上 | 同上 |
-| | `InlineSearchBackwardShort` | ⚠️ 同上 | 同上 |
-| | `InlineSearchNext` | ✅ **是** | 同上 |
-| | `InlineSearchPrevious` | ✅ **是** | 同上 |
-| | `SemanticSearchForward` | ✅ **是** | `start_seeded_search` → 多次 `goto_match` |
-| | `SemanticSearchBackward` | ✅ **是** | 同上 |
-| **SearchAction** | `SearchFocusNext` | ✅ **是** | `scroll_to_point` + `goto_match(None)` |
-| | `SearchFocusPrevious` | ✅ **是** | 同上 |
-| | `SearchConfirm` (Vi) | ⚠️ 仅无结果时 | `goto_match(None)` 无结果 → `search_reset_state` |
-| | `SearchConfirm` (非 Vi) | ❌ **否** | `cancel_search` → 创建选区，不滚动 |
-| | `SearchCancel` (Vi) | ✅ **是** | `search_reset_state` → 恢复视口 |
-| | `SearchCancel` (非 Vi) | ❌ **否** | 创建选区，不滚动 |
-| | `SearchClear` | ⚠️ 取决于取消 | `cancel_search` → `start_search` |
-| | `SearchDeleteWord` | ⚠️ 取决于匹配 | `update_search` → `goto_match` |
-| | `SearchHistoryPrevious` | ⚠️ 取决于匹配 | `update_search` → `goto_match` |
-| | `SearchHistoryNext` | ⚠️ 取决于匹配 | `update_search` → `goto_match` |
+| 层级 | 动作 | Vi 模式滚动 | 非 Vi 模式滚动 |
+|------|------|-----------|--------------|
+| **顶层 Action** | `SearchForward` | ⚠️ 启动不滚；输入有匹配✅ / 无限搜索没找到✅恢复 | ⚠️ 启动不滚；输入有匹配✅ / 没找到❌ |
+| | `SearchBackward` | 同上 | 同上 |
+| **ViAction** | `SearchNext` | ✅ `vi_goto_point` | N/A（仅 Vi 模式） |
+| | `SearchPrevious` | ✅ 同上 | N/A |
+| | `SearchStart` | ✅ 同上 | N/A |
+| | `SearchEnd` | ✅ 同上 | N/A |
+| | `InlineSearchForward` | ⚠️ 启动不滚；输入字符后匹配✅ | N/A |
+| | `InlineSearchBackward` | ⚠️ 同上 | N/A |
+| | `InlineSearchForwardShort` | ⚠️ 同上 | N/A |
+| | `InlineSearchBackwardShort` | ⚠️ 同上 | N/A |
+| | `InlineSearchNext` | ✅ `vi_goto_point` | N/A |
+| | `InlineSearchPrevious` | ✅ 同上 | N/A |
+| | `SemanticSearchForward` | ✅ 多次 `goto_match` + `vi_goto_point` | N/A |
+| | `SemanticSearchBackward` | ✅ 同上 | N/A |
+| **SearchAction** | `SearchConfirm` | 有延迟搜索：找到✅ / 没找到✅恢复；无延迟搜索❌ | ❌ 等价 cancel：创建选区不滚 / 无操作 |
+| | `SearchCancel` | ✅ `search_reset_state` 始终恢复视口 | ❌ 创建选区不滚 / 无操作 |
+| | `SearchFocusNext` | 有匹配✅ / 没匹配✅恢复 | 有匹配✅ / 没匹配❌ |
+| | `SearchFocusPrevious` | 同上 | 同上 |
+| | `SearchClear` | ✅ cancel 恢复视口 | ❌ cancel 创建选区不滚 |
+| | `SearchDeleteWord` | 找到✅ / 有限没找到❌ / 无限没找到✅恢复 | 找到✅ / 没找到❌ |
+| | `SearchHistoryPrevious` | 同上 | 同上 |
+| | `SearchHistoryNext` | 同上 | 同上 |
+
+**滚动决策的通用规律**：
+
+1. **Vi 模式独有**：`search_reset_state()` 会在搜索失败或取消时**恢复视口**（用 `display_offset_delta` 回滚），而非 Vi 模式从不恢复视口
+2. **找到匹配时**：两种模式都会滚动视口对齐到匹配（Vi 用 `vi_goto_point`，非 Vi 用 `scroll_to_point`）
+3. **延迟搜索定时器**：Vi 模式下 `SearchConfirm` 检测定时器并完成搜索，可能触发新的滚动；无定时器则不滚动
+4. **只改状态不滚**：`start_search()`、`start_inline_search()` 只设置搜索状态，不做任何滚动
 
 ---
 
