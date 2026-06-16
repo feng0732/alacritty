@@ -1,9 +1,9 @@
 # Winit 窗口与事件链调用顺序详解
 
 本文档沿着实际代码追踪 winit 事件链的每一步，重点讲清：
-1. **显示更新与实际绘制的层级关系**（哪些改状态，哪些改 GL，哪些真的画）
+1. **显示更新与实际绘制的职责边界**（哪层只记状态、哪层计算、哪层动 GL）
 2. **等待回调如何设置唤醒时机**（about_to_wait → ControlFlow::WaitUntil）
-3. **Frame 事件如何回到窗口重绘**（调度器 → user_event → request_redraw → RedrawRequested）
+3. **Frame 事件怎样回到窗口重绘**（调度器 → user_event → request_redraw → RedrawRequested）
 
 ---
 
@@ -35,9 +35,340 @@ winit 回调: window_event / user_event
 
 ---
 
-## 二、等待回调设置唤醒时机（Scheduler + about_to_wait）
+## 二、显示更新与实际绘制的职责边界（三层结构）
 
-### 2.1 触发链
+这是最容易读错的部分。系统用 **三层缓冲** 把"记状态"、"算布局"、"动 GL" 严格分开。
+
+### 第一层：只记录待处理状态（DisplayUpdate）
+
+**存储**：`display.pending_update`，类型 `DisplayUpdate`
+
+**位置**：[display/mod.rs#L304-L339](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L304-L339)
+
+```rust
+pub struct DisplayUpdate {
+    pub dirty: bool,              // 总开关：是否有待处理更新
+    dimensions: Option<PhysicalSize<u32>>,  // 窗口新尺寸
+    font: Option<Font>,           // 新字体配置
+    cursor_dirty: bool,           // 光标样式是否变化
+}
+```
+
+**三个 setter**（全是纯设值，零计算）：
+
+```rust
+pub fn set_dimensions(&mut self, dimensions: PhysicalSize<u32>) {
+    self.dimensions = Some(dimensions);
+    self.dirty = true;             // 同时打开总开关
+}
+
+pub fn set_font(&mut self, font: Font) {
+    self.font = Some(font);
+    self.dirty = true;
+}
+
+pub fn set_cursor_dirty(&mut self) {
+    self.cursor_dirty = true;
+    self.dirty = true;
+}
+```
+
+**设置位置分布**：
+
+| 设置点 | 代码位置 | 设置什么 |
+|--------|----------|----------|
+| 配置热重载（字体/光标厚度变化） | [window_context.rs#L272-L283](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L272-L283) | set_cursor_dirty / set_font |
+| 配置热重载（padding/dynamic_padding 变化） | [window_context.rs#L295](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L295) | dirty = true |
+| 窗口 Resized 事件 | input::Processor 的 Resized 分支 | set_dimensions |
+| 缩放字体（IncreaseFontSize 等） | [event.rs#L926](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/event.rs#L926) | set_font |
+| 弹出/关闭消息栏 | [event.rs#L940](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/event.rs#L940) | dirty = true |
+| 进入/退出搜索模式 | [event.rs#L980](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/event.rs#L980) | dirty = true |
+| 进入/退出 Vi 模式 | [event.rs#L1613](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/event.rs#L1613) | dirty = true |
+| 收到 Message 事件 | [event.rs#L1865](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/event.rs#L1865) | dirty = true |
+| 配置热重载（移除消息后） | [event.rs#L348](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/event.rs#L348) | dirty = true |
+
+**关键特征**：
+- ✅ 只改 `pending_update` 内部字段
+- ✅ 不改 `size_info`、不改 terminal、不改 GL
+- ✅ 不做任何计算（甚至连新的 cell 尺寸都不算）
+- ✅ 调用后唯一副作用：`dirty = true`
+
+---
+
+### 第二层：应用显示更新（handle_update）—— 算布局、排 GL、但不动 GL
+
+**触发点**：[window_context.rs#L461-L473](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L461-L473)
+
+批量事件处理完后，如果 `pending_update.dirty` 为 true，就调用 `submit_display_update()` → `display.handle_update()`。
+
+**核心函数**：`Display::handle_update()`
+
+**位置**：[display/mod.rs#L651-L737](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L651-L737)
+
+```rust
+pub fn handle_update<T>(
+    &mut self,
+    terminal: &mut Term<T>,
+    pty_resize_handle: &mut dyn OnResize,
+    message_buffer: &MessageBuffer,
+    search_state: &mut SearchState,
+    config: &UiConfig,
+) {
+    // 取出 pending_update 并清空（消费）
+    let pending_update = mem::take(&mut self.pending_update);
+
+    // ① 先检查：字体/光标变化 → 排队 GL 字体缓存清理
+    if pending_update.font().is_some() || pending_update.cursor_dirty() {
+        let renderer_update = self.pending_renderer_update.get_or_insert(Default::default());
+        renderer_update.clear_font_cache = true;  // ← 只排队，不执行
+    }
+
+    // ② 字体变化 → 更新 glyph_cache 字体大小 + 算新 cell 尺寸
+    //    注意：update_font_size 只改 CPU 侧的字体元数据，不改 GL 纹理
+    if let Some(font) = pending_update.font() {
+        let cell_dimensions = Self::update_font_size(&mut self.glyph_cache, config, font);
+        // cell_width, cell_height = ...
+    }
+
+    // ③ 尺寸变化 → 读新宽高
+    if let Some(dimensions) = pending_update.dimensions() {
+        // width, height = ...
+    }
+
+    // ④ 算 padding → 构建新 SizeInfo
+    let padding = config.window.padding(self.window.scale_factor as f32);
+    let mut new_size = SizeInfo::new(width, height, cell_width, cell_height, ...);
+
+    // ⑤ 减去消息栏/搜索栏占的行
+    new_size.reserve_lines(message_bar_lines + search_lines);
+
+    // ⑥ 设窗口 resize 增量（纯窗口系统调用，非 GL）
+    if config.window.resize_increments {
+        self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
+    }
+
+    // ⑦ 行列数变化 → resize PTY + resize Terminal grid
+    if self.size_info.screen_lines() != new_size.screen_lines()
+        || self.size_info.columns() != new_size.columns()
+    {
+        pty_resize_handle.on_resize(new_size.into());  // ← 通知 PTY 改尺寸
+        terminal.resize(new_size);                     // ← 改终端网格大小
+        self.damage_tracker.resize(...);               // ← 改 damage 跟踪器大小
+    }
+
+    // ⑧ 尺寸有变化 → 排队 GL resize
+    if new_size != self.size_info {
+        let renderer_update = self.pending_renderer_update.get_or_insert(Default::default());
+        renderer_update.resize = true;                 // ← 只排队，不执行
+    }
+
+    // ⑨ 更新 size_info（这是本函数最核心的产出）
+    self.size_info = new_size;
+}
+```
+
+#### 本层产出物
+
+| 产出 | 类型 | 去哪了 |
+|------|------|--------|
+| 新的 `self.size_info` | SizeInfo | 直接写入 Display，后续绘制用 |
+| `terminal.resize()` | 终端网格 | 直接改 terminal |
+| `pty.on_resize()` | PTY 尺寸 | 通知子进程窗口大小变了 |
+| `pending_renderer_update` | Option<RendererUpdate> | 排队到下一层，不立即执行 |
+
+#### 本层**绝对不做**的事
+
+- ❌ 不调用任何 GL 函数（`gl*`、`egl*`）
+- ❌ 不 `make_current()`（不激活 GL 上下文）
+- ❌ 不 `surface.resize()`（不动 GL 绘制表面）
+- ❌ 不清理字体纹理（`reset_glyph_cache` 要到 GL 层才做）
+
+> **为什么要分这一层？** 代码注释 [display/mod.rs#L739-L741](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L739-L741) 说得很清楚：
+>
+> Wayland 等平台要求 resize 和其他 GL 操作必须在**渲染前一刻**执行。否则会锁定 back buffer，导致用旧状态渲染，还会产生 resize 闪烁。
+>
+> 所以 layout 计算（handle_update）和 GL 操作（process_renderer_update）必须分开。
+
+---
+
+### 第三层：GL 更新 + 实际绘制
+
+这一层又分两步，都在 `WindowContext::draw()` 里按顺序执行。
+
+#### Step 3.1：process_renderer_update——执行排队的 GL 更新
+
+**入口**：[window_context.rs#L376](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L376)
+
+**函数**：[display/mod.rs#L744-L768](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L744-L768)
+
+```rust
+pub fn process_renderer_update(&mut self) {
+    let renderer_update = match self.pending_renderer_update.take() {
+        Some(u) => u,
+        _ => return,   // 没待处理的就直接返回
+    };
+
+    // ① Surface resize（需要 GL context，因为 surface 是 GL 绘制表面）
+    if renderer_update.resize {
+        self.surface.resize(&self.context, width, height);
+    }
+
+    // ② 确保当前窗口的 GL context 是激活的
+    self.make_current();
+
+    // ③ 清字体缓存（涉及 GL 纹理删除，必须 context current）
+    if renderer_update.clear_font_cache {
+        self.reset_glyph_cache();  // 内部用 renderer.with_loader() 调用 GL
+    }
+
+    // ④ Renderer resize（更新 uniform、视口矩阵等 GL 状态）
+    self.renderer.resize(&self.size_info);
+}
+```
+
+**调用时机**：在 `WindowContext::draw()` 的**最开头**，在收集渲染内容之前。
+
+**执行后**：`pending_renderer_update` 被 `take()` 消费掉，变为 `None`。
+
+#### Step 3.2：Display::draw——收集内容 + GL 绘制 + 上屏
+
+**入口**：[window_context.rs#L391](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L391)
+
+**函数**：[display/mod.rs#L775-L1047](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L775-L1047)
+
+```rust
+pub fn draw<T: EventListener>(
+    &mut self,
+    mut terminal: MutexGuard<'_, Term<T>>,
+    scheduler: &mut Scheduler,
+    message_buffer: &MessageBuffer,
+    config: &UiConfig,
+    search_state: &mut SearchState,
+) {
+    // ── 阶段 A：收集渲染内容（拿终端锁，但尽快释放）──
+
+    // ① 收集 RenderableContent（终端网格 → 可渲染单元迭代器）
+    let mut content = RenderableContent::new(config, self, &terminal, search_state);
+    let mut grid_cells = Vec::new();
+    for cell in &mut content {
+        grid_cells.push(cell);
+    }
+    // ② 收集选择范围、颜色、光标等辅助信息
+    let selection_range = content.selection_range();
+    let cursor = content.cursor();
+    // ...
+
+    // ③ 合并终端 damage 到帧 damage
+    match terminal.damage() {
+        TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
+        TermDamage::Partial(lines) => { /* 逐行 damage */ },
+    }
+    terminal.reset_damage();
+
+    // ④ 尽早释放终端锁！（减少 I/O 线程阻塞时间）
+    drop(terminal);
+
+    // ── 阶段 B：计算 damage（不再需要终端锁）──
+
+    // ⑤ UI 元素（视觉铃 / 提示 / 搜索栏）强制全 damage
+    let requires_full_damage = self.visual_bell.intensity() != 0.
+        || self.hint_state.active()
+        || search_state.regex().is_some();
+
+    // ⑥ Vi 光标 damage + 选择区域 damage
+    self.damage_tracker.damage_vi_cursor(...);
+    self.damage_tracker.damage_selection(...);
+
+    // ── 阶段 C：GL 绘制 ──
+
+    // ⑦ 激活本窗口的 GL context
+    self.make_current();
+
+    // ⑧ 清屏
+    self.renderer.clear(background_color, config.window_opacity());
+
+    // ⑨ 画文字网格
+    self.renderer.draw_cells(&size_info, glyph_cache, cells);
+
+    // ⑩ 画矩形（光标 / 下划线 / 删除线 / 视觉铃）
+    self.renderer.draw_rects(&size_info, &metrics, rects);
+
+    // ⑪ 画文字（消息栏 / 搜索栏 / 行号指示器）
+    self.renderer.draw_string(point, fg, bg, text.chars(), ...);
+
+    // ── 阶段 D：上屏 + 调度 ──
+
+    // ⑫ macOS 预备 present 通知
+    self.window.pre_present_notify();
+
+    // ⑬ swap_buffers —— 真正上屏
+    self.swap_buffers();
+
+    // ⑭ X11: renderer.finish() 消除一帧延迟
+    //     （X11 swap_buffers 不阻塞，下一条 GL 命令才阻塞）
+
+    // ⑮ 非 Wayland：调度下一帧 Frame 事件
+    if !matches!(self.raw_window_handle, Wayland(_)) {
+        self.request_frame(scheduler);
+    }
+
+    // ⑯ 轮换 damage 缓冲区（下一帧从零开始算 damage）
+    self.damage_tracker.swap_damage();
+}
+```
+
+#### draw() 的真实职责
+
+draw() 不是"只负责收集内容和上屏"，它做了四类事情：
+
+| 类别 | 内容 | 占比 |
+|------|------|------|
+| 内容收集 | RenderableContent 迭代、选择范围、光标、颜色 | 少 |
+| Damage 计算 | 终端 damage + UI damage + 光标 damage + 选择 damage | 中 |
+| GL 绘制 | clear + draw_cells + draw_rects + draw_string | 核心 |
+| 帧调度 | swap_buffers + request_frame + swap_damage | 少 |
+
+但有一条清晰的红线：**draw() 不改业务状态**（terminal、size_info、config 都是只读或加锁读）。它消费状态，产出新的一帧。
+
+---
+
+### 三层结构总览
+
+```
+┌─────────────────────────────────────────────────────┐
+│  第一层：DisplayUpdate (pending_update)              │
+│  只记状态：dimensions / font / cursor_dirty / dirty  │
+│  零计算、零副作用、不动 GL                           │
+└────────────────────────┬────────────────────────────┘
+                         │ pending_update.dirty == true
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│  第二层：handle_update()                             │
+│  ✅ 算：cell 尺寸 / SizeInfo / padding / 行列数       │
+│  ✅ 改：terminal.resize / pty.on_resize              │
+│  ✅ 排：pending_renderer_update（GL 操作队列）        │
+│  ❌ 不动 GL / 不 make_current / 不 resize surface     │
+└────────────────────────┬────────────────────────────┘
+                         │ RedrawRequested 触发 draw()
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│  第三层：process_renderer_update() + draw()          │
+│  3.1 process_renderer_update                         │
+│    - surface.resize / make_current / 清字体纹理       │
+│    - renderer.resize（uniform/视口）                 │
+│  3.2 draw()                                          │
+│    - 收集内容 + 合并 damage                          │
+│    - GL 绘制（cells/rects/strings）                  │
+│    - swap_buffers 上屏                               │
+│    - 调度下一帧（request_frame）                     │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 三、等待回调设置唤醒时机（Scheduler + about_to_wait）
+
+### 3.1 触发链
 
 事件队列即将耗尽时，winit 调用：
 
@@ -58,7 +389,9 @@ fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
 }
 ```
 
-### 2.2 Scheduler::update() 内部机制
+**注意顺序**：先排空窗口的事件队列（可能产生新的定时器），再更新调度器，保证 deadline 准确。
+
+### 3.2 Scheduler::update() 内部机制
 
 **[scheduler.rs#L58-L73](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/scheduler.rs#L58-L73)**
 ```rust
@@ -83,7 +416,7 @@ pub fn update(&mut self) -> Option<Instant> {
 }
 ```
 
-### 2.3 定时器如何入队
+### 3.3 定时器入队规则
 
 **[scheduler.rs#L76-L90](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/scheduler.rs#L76-L90)**
 
@@ -95,11 +428,11 @@ pub fn update(&mut self) -> Option<Instant> {
 |-------|------|--------|----------|
 | Frame | 单次 | `Display::request_frame()` | 对齐到 vblank 的下一个绘制槽 |
 | BlinkCursor | 周期 | 光标闪烁逻辑 | 触发光标切换可见性 |
-| BlinkTimeout | 单次 | 键盘/鼠标活动后 | 光标停止闪烁进入省电 |
+| BlinkTimeout | 单次 | 键盘/鼠标活动后重置 | 光标停止闪烁进入省电 |
 | SelectionScrolling | 周期 | 鼠标在窗口外选择时 | 每 15ms 滚动终端 |
 | DelayedSearch | 单次 | 搜索输入延迟 | 延迟搜索触发 |
 
-### 2.4 唤醒时机设置示例
+### 3.4 唤醒时机示例
 
 假设显示器 60Hz（16.667ms/帧），刚 swap_buffers 后调用 `request_frame()`：
 1. `FrameTimer::compute_timeout()` 算出距下一个 vblank 相位点还有 12ms
@@ -107,11 +440,11 @@ pub fn update(&mut self) -> Option<Instant> {
 3. 事件队列耗尽触发 `about_to_wait()`
 4. `scheduler.update()` 发现队首 Frame 定时器还有 10ms 才到，返回该 Instant
 5. `event_loop.set_control_flow(WaitUntil(该Instant))`
-6. winit 阻塞到该时刻，超时后自动唤醒事件循环，产生 `StartCause::WaitCancelled` 或直接触发 `user_event`
+6. winit 阻塞到该时刻，超时后自动唤醒事件循环
 
 ---
 
-## 三、Frame 事件回到窗口重绘的完整路径
+## 四、Frame 事件回到窗口重绘的完整路径
 
 这是最容易跳读的链路，共 **7 步**：
 
@@ -231,235 +564,6 @@ handle_event() 排空队列 → draw() 真正绘制
 
 ---
 
-## 四、显示更新与实际绘制的层级
-
-整个系统分 **4 个层级**，每一层只做自己该做的事，绝不越界：
-
-### 层级 1：事件入队（只记不改）
-
-**位置**：[window_context.rs#L409-L423](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L409-L423)
-
-```rust
-match event {
-    AboutToWait | RedrawRequested => { /* 继续往下处理 */ },
-    event => {
-        self.event_queue.push(event);  // ← 仅入队，立即返回
-        return;
-    },
-}
-```
-
-**除了 AboutToWait 和 RedrawRequested，其他所有事件一律入队等批处理**。包括：
-- 键盘、鼠标、触摸、IME
-- 窗口 Resized、ScaleFactorChanged、Focused、Occluded
-- 自定义 Event（如 BlinkCursor、ConfigReload 等）
-
-### 层级 2：批量处理（改终端状态 + 改 DisplayUpdate 缓冲）
-
-**触发时机**：收到 AboutToWait 或 RedrawRequested，且 event_queue 非空。
-
-**位置**：[window_context.rs#L425-L473](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L425-L473)
-
-```rust
-// ① 获取终端锁
-let mut terminal = self.terminal.lock();
-
-// ② 构建 ActionContext（把 WindowContext 拆成引用视图）
-let context = ActionContext { terminal: &mut terminal, display: &mut self.display, ... };
-
-// ③ input::Processor 逐个处理事件
-let mut processor = input::Processor::new(context);
-for event in self.event_queue.drain(..) {
-    processor.handle_event(event);
-}
-```
-
-#### input::Processor 处理结果产出两类东西：
-
-| 产出 | 存储位置 | 含义 |
-|------|----------|------|
-| 终端内容变更 | `terminal.grid()` | 直接写终端缓冲区，同时标 damage |
-| 显示配置变更 | `display.pending_update` (DisplayUpdate) | **不直接生效，先缓存** |
-
-**DisplayUpdate 结构**：[display/mod.rs#L304-L310](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L304-L310)
-```rust
-pub struct DisplayUpdate {
-    pub dirty: bool,              // 是否有待处理更新
-    dimensions: Option<PhysicalSize<u32>>,  // 窗口尺寸变化
-    cursor_dirty: bool,           // 光标样式变化
-    font: Option<Font>,           // 字体大小变化
-}
-```
-
-这些字段在 input 处理时通过 `ActionContext` 的 setter 写入 `pending_update`，但不立即应用。
-
-### 层级 3：DisplayUpdate 提交（改 SizeInfo + 排 GL 操作）
-
-**触发**：批量处理结束后，如果 `pending_update.dirty` 为 true。
-
-**位置**：[window_context.rs#L461-L473](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L461-L473)
-```rust
-if self.display.pending_update.dirty {
-    Self::submit_display_update(&mut terminal, &mut self.display, ...);
-    self.dirty = true;  // 提交后标脏，触发重绘
-}
-```
-
-#### submit_display_update → display.handle_update()
-
-**位置**：[display/mod.rs#L651-L737](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L651-L737)
-
-```rust
-pub fn handle_update<T>(&mut self, terminal, pty_resize_handle, ...) {
-    let pending_update = mem::take(&mut self.pending_update);  // 取出并清空
-
-    // ① 如果改了字体 / 光标样式 → 排进 pending_renderer_update（GL 层）
-    if pending_update.font().is_some() || pending_update.cursor_dirty() {
-        let renderer_update = self.pending_renderer_update.get_or_insert(...);
-        renderer_update.clear_font_cache = true;
-    }
-
-    // ② 计算新 cell_width / cell_height（字体变化时）
-    // ③ 计算新窗口尺寸（dimensions 变化时）
-    // ④ 构建新 SizeInfo
-    // ⑤ 如果行列数变了 → resize PTY + resize Terminal grid
-    // ⑥ 如果尺寸变了 → 标记 pending_renderer_update.resize = true
-    self.size_info = new_size;
-}
-```
-
-**关键设计**：`handle_update()` **不做任何 GL 调用**。所有需要 GL context current 的操作都被延迟到 `pending_renderer_update`，在下一层处理。
-
-注释说明原因（[display/mod.rs#L739-L741](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L739-L741)）：
-> Wayland 等平台要求 resize 和其他 GL 操作必须在渲染前一刻执行，否则会锁定 back buffer 并用旧状态渲染，还会导致 resize 闪烁。
-
-### 层级 4：实际绘制（GL 操作 + swap_buffers）
-
-#### Step 4.1: WindowContext::draw() 预处理
-
-**位置**：[window_context.rs#L366-L398](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/window_context.rs#L366-L398)
-```rust
-pub fn draw(&mut self, scheduler: &mut Scheduler) {
-    self.display.window.requested_redraw = false;  // 清请求标志
-
-    if self.occluded { return; }  // 窗口被遮挡，不画
-
-    self.dirty = false;           // 清脏标志
-
-    // ① 先执行上一层排队的 GL 操作
-    self.display.process_renderer_update();
-
-    // ② 视觉铃动画未结束 → 再请求下一帧
-    if !self.display.visual_bell.completed() {
-        if self.display.window.has_frame {
-            self.display.window.request_redraw();
-        } else {
-            self.dirty = true;
-        }
-    }
-
-    // ③ 拿终端锁 → 调 Display::draw()
-    let terminal = self.terminal.lock();
-    self.display.draw(terminal, scheduler, ...);
-}
-```
-
-#### Step 4.2: process_renderer_update（真正改 GL 状态）
-
-**位置**：[display/mod.rs#L744-L768](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L744-L768)
-```rust
-pub fn process_renderer_update(&mut self) {
-    let renderer_update = match self.pending_renderer_update.take() {
-        Some(u) => u, _ => return,  // 没待处理就返回
-    };
-
-    // ① Surface resize（需要 GL context）
-    if renderer_update.resize {
-        self.surface.resize(&self.context, width, height);
-    }
-
-    // ② make_current（确保我们在改正确的 GL context）
-    self.make_current();
-
-    // ③ 清字体缓存（GL 纹理操作）
-    if renderer_update.clear_font_cache {
-        self.reset_glyph_cache();
-    }
-
-    // ④ Renderer resize（更新 uniform、视口等）
-    self.renderer.resize(&self.size_info);
-}
-```
-
-#### Step 4.3: Display::draw() 真正上屏
-
-**位置**：[display/mod.rs#L775-L1047](file:///d:/fz/0601/solo-dogfeeding/code/337-alacritty/alacritty/src/display/mod.rs#L775-L1047)
-
-```rust
-pub fn draw<T: EventListener>(&mut self, mut terminal: MutexGuard<'_, Term<T>>, ...) {
-    // ① process_renderer_update（再次确认，可能在 handle_update 之后才标脏）
-    self.process_renderer_update();
-
-    // ② 尽早释放终端锁！（减少 I/O 线程阻塞）
-    //    收集完 RenderableContent 就 drop terminal
-    //    ... damage 合并、选择计算、光标计算都在这里 ...
-
-    // ③ make_current
-    self.make_current();
-
-    // ④ GL 绘制调用
-    self.renderer.clear(&self.colors.background);
-    self.renderer.draw_cells(...);        // 文字
-    self.renderer.draw_rects(...);        // 光标/下划线
-    self.renderer.draw_string(...);       // UI 文本
-
-    // ⑤ 通知 winit 即将 present（macOS 需要）
-    self.window.pre_present_notify();
-
-    // ⑥ swap_buffers 上屏
-    self.swap_buffers();
-
-    // ⑦ X11: renderer.finish() 解决一帧延迟问题
-
-    // ⑧ 调度下一帧（非 Wayland）
-    self.request_frame(scheduler);
-
-    // ⑨ 轮换 damage 缓冲区（新帧从空 damage 开始）
-    self.damage_tracker.swap_damage();
-}
-```
-
-### 四层总结
-
-```
-事件到达
-  │
-  ├─ 层级1: event_queue 入队（只记不改）[window_context.rs#L409-L423]
-  │
-  ▼ 收到 AboutToWait / RedrawRequested 且队列非空
-  │
-  ├─ 层级2: input::Processor 批量处理
-  │     ├─ 改 terminal（直接生效 + 标 damage）
-  │     └─ 改 display.pending_update（DisplayUpdate 缓冲）
-  │
-  ▼ pending_update.dirty?
-  │
-  ├─ 层级3: submit_display_update → handle_update()
-  │     ├─ 改 SizeInfo（窗口/字体尺寸计算）
-  │     ├─ resize PTY + Terminal grid
-  │     └─ 排队 GL 操作到 pending_renderer_update
-  │
-  ▼ RedrawRequested 触发 draw()
-  │
-  └─ 层级4: 实际绘制
-        ├─ process_renderer_update()（surface resize / make_current / 清字体缓存）
-        ├─ draw_cells / draw_rects / draw_string（GL 调用）
-        ├─ swap_buffers（上屏）
-        └─ request_frame（调度下一帧，回到循环开始）
-```
-
----
-
 ## 五、各状态标志的流转时机
 
 ### 5.1 dirty（终端内容变了需要重绘）
@@ -488,12 +592,12 @@ pub fn draw<T: EventListener>(&mut self, mut terminal: MutexGuard<'_, Term<T>>, 
 
 **作用**：一帧内多次调用 request_redraw 只实际调一次 winit API。
 
-### 5.4 pending_update.dirty / pending_renderer_update
+### 5.4 两层 pending 标志对比
 
-| 标志 | 层级 | 设置 | 消费 |
-|------|------|------|------|
-| pending_update.dirty | 2→3 | input 处理器写入 dimensions/font/cursor_dirty | `handle_update()` 中 `mem::take()` |
-| pending_renderer_update | 3→4 | `handle_update()` 标记 resize / clear_font_cache | `process_renderer_update()` 中 `take()` |
+| 标志 | 层级 | 设置者 | 消费者 | 设置后做了什么 |
+|------|------|--------|--------|----------------|
+| pending_update.dirty | 1→2 | input 处理器 / config / window 事件 | handle_update() | 只设标志，什么都不做 |
+| pending_renderer_update | 2→3 | handle_update() | process_renderer_update() | 只排队 GL 操作，不执行 |
 
 ---
 
@@ -520,7 +624,7 @@ Wayland 平台完全跳过 `request_frame()` 调度器路径：
    └─ window_context.handle_event(WinitEvent::WindowEvent{KeyboardInput})
 ③ WindowContext::handle_event() [window_context.rs#L401]
    ├─ 不是 AboutToWait / RedrawRequested
-   └─ self.event_queue.push(event); return;   ← 入队，不处理
+   └─ self.event_queue.push(event); return;   ← 入第一层：仅记录
 ④ 事件队列耗尽，winit 调 about_to_wait() [event.rs#L466]
 ⑤ 每个窗口 handle_event(AboutToWait)
    ├─ 是 AboutToWait，且队列非空 → 继续
@@ -550,10 +654,12 @@ Wayland 平台完全跳过 `request_frame()` 调度器路径：
 ⑫ WindowContext::draw() [window_context.rs#L366]
     ├─ requested_redraw = false
     ├─ dirty = false
-    ├─ process_renderer_update()（这次没 GL 更新）
+    ├─ process_renderer_update()（这次没 GL 更新，直接返回）
     └─ self.display.draw(terminal, scheduler, ...)
 ⑬ Display::draw() [display/mod.rs#L775]
     ├─ 收集 RenderableContent（包含新输出的 "a"）
+    ├─ 合并 damage
+    ├─ make_current()
     ├─ draw_cells() 把文字变成 GPU 绘制指令
     ├─ swap_buffers() 上屏
     ├─ request_frame(scheduler) → 排下一个 Frame 定时器
