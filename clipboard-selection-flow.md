@@ -1,8 +1,39 @@
 # 剪贴板与选择 状态流转与交互流程
 
-## 一、鼠标释放后选区的状态
+---
 
-### 1.1 结论：选区继续保留
+## 一、核心结论速览
+
+### 1.1 鼠标释放 → 选区继续保留
+
+| 操作 | 行为 | 选区状态 |
+|------|------|----------|
+| 鼠标释放 | 调用 `copy_selection(Selection)` 复制到主选区剪贴板 | 保留，继续高亮 |
+| 点击别处 | 先 `clear_selection()`，再 `start_selection()` | 清除后重建 |
+| 内容变化 | 相交则整体丢弃，不相交则保留 | 视情况而定 |
+
+### 1.2 三种清除场景的处理策略
+
+| 场景 | 代码模式 | 处理策略 |
+|------|----------|----------|
+| 内容清除（Above/Below/行清除） | `filter(!intersects_range)` | **整体丢弃**（相交就全丢） |
+| 历史清除（ClearMode::Saved） | `filter(!intersects_range(..Line(0)))` | **整体丢弃（相交时），完全不相交则保留** |
+| 行范围相交（行清除等） | `intersects_range` 只检查行 | **整体丢弃**（不裁剪） |
+| 滚动跟随 | `rotate()` 方法 | **裁剪**（部分滚出则截断到边界） |
+
+### 1.3 剪贴板交互的三条路径
+
+| 路径 | 方向 | 触发方 | 关键代码 |
+|------|------|--------|----------|
+| 用户复制 | 选区 → 剪贴板 | 用户 | `copy_selection()` |
+| 用户粘贴 | 剪贴板 → PTY | 用户 | `clipboard.load()` + `paste()` |
+| 终端剪贴板请求（OSC 52） | 双向 | 终端程序 | `ClipboardStore` / `ClipboardLoad` 事件 |
+
+---
+
+## 二、鼠标释放后选区的状态
+
+### 2.1 结论：选区继续保留
 
 鼠标释放**不会清除**选区，只是将选区内容复制到剪贴板。选区仍然保留在终端状态中，视觉上继续高亮显示。
 
@@ -23,7 +54,7 @@ fn on_mouse_release(&mut self, button: MouseButton) {
 }
 ```
 
-### 1.2 释放后的状态
+### 2.2 释放后的状态流转
 
 ```
 鼠标按下 → 拖动 → 鼠标释放
@@ -35,104 +66,233 @@ selection selection (Selection类型)
                   选区仍然保留 ✓
 ```
 
-### 1.3 选区保留期间的行为
+### 2.3 选区保留期间的行为
 
 释放后选区继续存在，直到：
 - 用户在其他位置点击（`clear_selection` 后开始新选择）
-- 终端内容发生变化（见第二章）
+- 终端内容发生变化（见第三章）
 - 用户显式触发 `ClearSelection` 动作
 - 切换到/退出 alt screen
 
-在 VI 模式下，释放后还可以通过键盘移动光标来继续扩展选区，由 `vi_mode_recompute_selection()` 更新：[term/mod.rs#L870-L881](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L870-L881)
+在 VI 模式下，释放后还可以通过键盘移动光标来继续扩展选区：
+
+```rust
+fn vi_mode_recompute_selection(&mut self) {
+    if !self.mode.contains(TermMode::VI) { return; }
+    if let Some(selection) = self.selection.as_mut().filter(|s| !s.is_empty()) {
+        selection.update(self.vi_mode_cursor.point, Side::Left);
+        selection.include_all();
+    }
+}
+```
+[term/mod.rs#L870-L881](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L870-L881)
 
 ---
 
-## 二、终端内容变化导致选区清除的完整场景
+## 三、选区清除的精确策略分析
 
-选区清除策略遵循一个原则：**如果文本内容发生变化导致选区位置失效，就清除或过滤选区**。
+### 3.1 相交判断的核心逻辑
 
-### 2.1 完全清除选区（设置为 None）
-
-| 场景 | 代码位置 | 触发原因 |
-|------|----------|----------|
-| 列数变化 | [term/mod.rs#L682](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L682) | 窗口宽度调整，列对齐失效 |
-| 切换主/辅屏幕 | [term/mod.rs#L733](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L733) | `swap_alt()` 切换 grid，选区属于旧屏幕 |
-| 清除全部屏幕 | [term/mod.rs#L1803](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1803) | `ClearMode::All`，所有内容被清除 |
-| 终端重置 | [term/mod.rs#L1847](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1847) | `reset_state()`，终端完全重置 |
-
-### 2.2 部分清除（过滤相交范围）
-
-如果只有部分行的内容变化，采用「过滤相交」策略：只清除与变化范围相交的选区部分，不相交的保留。
-
-使用 `intersects_range(range)` 判断是否相交，不相交则保留：
+所有「部分清除」场景都使用同一模式：
 
 ```rust
 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
 ```
 
-| 场景 | 代码位置 | 清除范围 |
-|------|----------|----------|
-| 清除行内部分内容 | [term/mod.rs#L1657](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1657) | 当前行 `cursor.line..=cursor.line` |
-| 清除光标以上内容 | [term/mod.rs#L1773](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1773) | `Line(0)..=cursor.line` |
-| 清除光标以下内容 | [term/mod.rs#L1786](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1786) | `cursor.line..Line(screen_lines)` |
-| 清除历史记录 | [term/mod.rs#L1811](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1811) | `..Line(0)`（历史区内的部分） |
+`intersects_range` 的实现：[selection.rs#L228-L249](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/selection.rs#L228-L249)
 
-### 2.3 选区跟随滚动（旋转而非清除）
+```rust
+pub fn intersects_range<R: RangeBounds<Line>>(&self, range: R) -> bool {
+    let mut start = self.region.start.point.line;
+    let mut end = self.region.end.point.line;
+    if start > end { mem::swap(&mut start, &mut end); }
 
-当滚动发生时，选区不会被清除，而是通过 `rotate()` 方法跟随内容一起移动。如果选区被滚出可视区域，则返回 `None`（被清除）。
+    let range_top = ...; // 解析范围上界
+    let range_bottom = ...; // 解析范围下界
 
-| 场景 | 代码位置 | 行为 |
-|------|----------|------|
-| 行数变化（窗口高度调整） | [term/mod.rs#L686-L689](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L686-L689) | 调用 `rotate` 调整选区位置 |
-| 向下滚动（内容下移） | [term/mod.rs#L751-L752](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L751-L752) | `scroll_down_relative` 中旋转 |
-| 向上滚动（内容上移） | [term/mod.rs#L778](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L778) | `scroll_up_relative` 中旋转 |
+    // 关键：只要行范围有任何重叠，就返回 true
+    range_bottom >= start && range_top <= end
+}
+```
 
-`rotate()` 方法的行为：[selection.rs#L137-L191](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/selection.rs#L137-L191)
-- 选区起止点在滚动范围内 → 跟随移动
-- 选区部分滚出 → 截断到边界
-- 选区完全滚出 → 返回 `None`（清除）
+**关键特点：**
+- 只检查**行级别**的相交，不检查列
+- 只要选区的行范围与被清除范围有任何重叠，就视为相交
+- `filter(!intersects)` 意味着：**相交 → 整体丢弃，不相交 → 完整保留**
+- **没有任何裁剪逻辑**，不会保留不相交的部分
 
-### 2.4 不清除选区的操作
+### 3.2 场景一：内容清除（clear_screen）
 
-注意：以下行内编辑操作**不会**触发选区清除：
+**代码位置**：[term/mod.rs#L1750-L1818](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1750-L1818)
+
+| 清除模式 | 清除范围 | 选区处理 |
+|----------|----------|----------|
+| `Above` | `Line(0)..=cursor.line` | 相交则整体丢弃 |
+| `Below` | `cursor.line..Line(screen_lines)` | 相交则整体丢弃 |
+| `All` | 全部 | 直接设为 `None`（全部丢弃） |
+
+**示例：**
+```
+选区覆盖行 2-5
+执行清除光标以上内容（光标在行 3）
+清除范围：行 0-3
+选区行 2-5 与范围 0-3 相交 → 整个选区被丢弃
+即使行 4-5 没被清除，选区也整体消失
+```
+
+代码：
+```rust
+// ClearMode::Above
+let range = Line(0)..=cursor.line;
+self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+
+// ClearMode::Below  
+let range = cursor.line..Line(screen_lines as i32);
+self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+
+// ClearMode::All
+self.selection = None;  // 直接全丢
+```
+
+### 3.3 场景二：历史清除（ClearMode::Saved）
+
+**代码位置**：[term/mod.rs#L1805-L1812](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1805-L1812)
+
+```rust
+// ClearMode::Saved
+self.grid.clear_history();
+self.selection = self.selection.take().filter(|s| !s.intersects_range(..Line(0)));
+```
+
+范围 `..Line(0)` 表示所有 `< Line(0)` 的行，即历史记录区。
+
+**策略：**
+- 选区只要有任何部分在历史区（line < 0）→ **整体丢弃**
+- 选区完全在可视区（所有 line >= 0）→ **完整保留**
+
+**示例：**
+```
+选区覆盖行 -3 到 2（跨历史区和可视区）
+清除历史记录
+选区与 ..Line(0) 相交 → 整个选区被丢弃
+即使可视区部分（行 0-2）没被清除，选区也整体消失
+```
+
+### 3.4 场景三：行范围相交（行清除等）
+
+**代码位置**：[term/mod.rs#L1656-L1657](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1656-L1657)
+
+```rust
+// clear_line
+let range = self.grid.cursor.point.line..=self.grid.cursor.point.line;
+self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+```
+
+**策略：整体丢弃**
+
+即使只是清除一行的部分内容（如 Left/Right 模式），也会检查**整行**是否相交，相交则整个选区丢弃。
+
+**极端示例：**
+```
+选区覆盖行 0-10，是一个很大的选区
+光标在行 5，执行清除行右侧内容（只清除行 5 的部分列）
+范围是行 5..=行 5
+选区与行 5 相交 → 整个选区（行 0-10）被丢弃
+即使行 0-4 和 6-10 的内容完全没变
+```
+
+### 3.5 唯一的裁剪场景：滚动跟随（rotate）
+
+`rotate()` 是唯一会**裁剪**选区而非整体丢弃的场景：[selection.rs#L137-L191](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/selection.rs#L137-L191)
+
+```rust
+pub fn rotate<D: Dimensions>(mut self, ...) -> Option<Selection> {
+    // ... 移动起止点 ...
+
+    // 起点滚出上边界 → 裁剪到上边界
+    if start.point.line < range_top && range_top != 0 {
+        if self.ty != SelectionType::Block {
+            start.point.column = Column(0);
+            start.side = Side::Left;
+        }
+        start.point.line = range_top;  // 裁剪
+    }
+
+    // 终点滚出下边界 → 裁剪到下边界
+    if end.point.line >= range_bottom {
+        if self.ty != SelectionType::Block {
+            end.point.column = dimensions.last_column();
+            end.side = Side::Right;
+        }
+        end.point.line = range_bottom - 1;  // 裁剪
+    }
+
+    // 完全滚出或起止交叉 → 返回 None（丢弃）
+    if end.point.line < start.point.line { return None; }
+
+    Some(self)
+}
+```
+
+**裁剪逻辑：**
+- 选区部分滚出上边界 → 起点裁剪到区域顶部，列设为 0（非 Block 模式）
+- 选区部分滚出下边界 → 终点裁剪到区域底部，列设为最后一列（非 Block 模式）
+- 选区完全滚出或起止点交叉 → 整体丢弃
+
+### 3.6 清除策略总表
+
+| 操作 | 策略 | 相交处理 | 不相交处理 | 代码 |
+|------|------|----------|------------|------|
+| 列数变化 | 整体丢弃 | - | - | `= None` |
+| 切换 alt screen | 整体丢弃 | - | - | `= None` |
+| Clear All | 整体丢弃 | - | - | `= None` |
+| 终端重置 | 整体丢弃 | - | - | `= None` |
+| Clear Above | 整体丢弃 | 丢弃 | 保留 | `filter(!intersects)` |
+| Clear Below | 整体丢弃 | 丢弃 | 保留 | `filter(!intersects)` |
+| Clear Line | 整体丢弃 | 丢弃 | 保留 | `filter(!intersects)` |
+| Clear Saved（历史） | 整体丢弃 | 丢弃 | 保留 | `filter(!intersects)` |
+| 向上/向下滚动 | 裁剪跟随 | 裁剪 | 跟随 | `rotate()` |
+| 行数变化 | 裁剪跟随 | 裁剪 | 跟随 | `rotate()` |
+
+### 3.7 不清除选区的操作
+
+以下行内编辑操作**不会**触发选区清除：
 - `insert_blank()` — 插入空白字符
 - `delete_chars()` — 删除字符
 - `erase_chars()` — 擦除字符
 
-这些操作只修改行内单元格内容，但不清除选区。这是设计选择还是潜在 bug 需进一步确认。
+这些操作只修改行内单元格内容，但不清除选区。这是因为它们只改变列内容，不改变行结构，而行级相交检查不会命中。
 
 ---
 
-## 三、粘贴读取流程
+## 四、粘贴读取流程
 
-### 3.1 用户触发的粘贴（UI → 剪贴板 → PTY）
+### 4.1 用户触发的粘贴（UI → 剪贴板 → PTY）
 
-这是最常见的粘贴场景：用户按 Ctrl+Shift+V 或通过菜单触发粘贴。
-
-**调用链：**
+**完整调用链：**
 
 ```
-用户按键/菜单
+用户按 Ctrl+Shift+V
     │
     ▼
-Action::Paste / Action::PasteSelection
+Action::Paste 匹配触发
     │
     ▼
-input/mod.rs: Action.execute()
+input/mod.rs: Action.execute()  [L327-L330]
     │
-    │  // 从剪贴板读取
-    │  let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
-    │  ctx.paste(&text, true);
-    ▼
-event.rs: paste(text, bracketed)
+    ├─ let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
+    │  └─ clipboard.rs: load(ty)  [L70-L83]
+    │      ├─ Selection 类型 + 有 selection 剪贴板 → 用 selection
+    │      └─ 其他情况 → 用系统剪贴板
     │
-    │  // 根据模式处理
-    │  ├─ 搜索模式 → 作为搜索输入
-    │  ├─ 内联搜索 → 作为搜索输入
-    │  ├─ 括号粘贴模式 → 加 \x1b[200~ ... \x1b[201~ 包裹
-    │  └─ 普通模式 → 换行符替换为 \r
-    ▼
-write_to_pty(...)  →  发送给终端进程
+    └─ ctx.paste(&text, true);
+        └─ event.rs: paste(text, bracketed)  [L1369-L1410]
+            ├─ 搜索模式 → 作为搜索字符输入
+            ├─ 括号粘贴模式 → \x1b[200~ + 过滤(\x1b,\x03) + \x1b[201~
+            └─ 普通模式 → \n → \r 替换
+                │
+                ▼
+        write_to_pty(payload) → 发送给终端进程
 ```
 
 **关键代码：**
@@ -149,69 +309,65 @@ write_to_pty(...)  →  发送给终端进程
   },
   ```
 
+- 剪贴板读取：[clipboard.rs#L70-L83](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/clipboard.rs#L70-L83)
+  ```rust
+  pub fn load(&mut self, ty: ClipboardType) -> String {
+      let clipboard = match (ty, &mut self.selection) {
+          (ClipboardType::Selection, Some(provider)) => provider,
+          _ => &mut self.clipboard,  // Windows/macOS 走这里
+      };
+      match clipboard.get_contents() {
+          Err(err) => String::new(),
+          Ok(text) => text,
+      }
+  }
+  ```
+
 - 粘贴实现：[event.rs#L1369-L1410](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L1369-L1410)
-  - 搜索模式下：作为搜索字符输入
-  - 括号粘贴模式：用 `\x1b[200~` 和 `\x1b[201~` 包裹文本，并过滤 `\x1b` 和 `\x03`
-  - 普通模式：将换行符替换为回车 `\r`
 
-### 3.2 剪贴板读取的平台行为
+### 4.2 平台差异
 
-`clipboard.load(ty)` 的行为：[clipboard.rs#L70-L83](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/clipboard.rs#L70-L83)
-
-```rust
-pub fn load(&mut self, ty: ClipboardType) -> String {
-    let clipboard = match (ty, &mut self.selection) {
-        (ClipboardType::Selection, Some(provider)) => provider,
-        _ => &mut self.clipboard,
-    };
-    match clipboard.get_contents() {
-        Err(err) => {
-            debug!("Unable to load text from clipboard: {err}");
-            String::new()
-        },
-        Ok(text) => text,
-    }
-}
-```
-
-关键点：
-- `Selection` 类型在无 selection 剪贴板的平台（macOS/Windows）上，**回退到系统剪贴板**
-- 读取失败返回空字符串，不报错
+| 平台 | Selection 剪贴板 | load(Selection) 行为 | store(Selection) 行为 |
+|------|-----------------|----------------------|----------------------|
+| X11 | 有（PRIMARY） | 读取 PRIMARY | 写入 PRIMARY |
+| Wayland | 有 | 读取 selection 剪贴板 | 写入 selection 剪贴板 |
+| macOS | 无 | 回退到系统剪贴板 | 直接返回（不写入） |
+| Windows | 无 | 回退到系统剪贴板 | 直接返回（不写入） |
 
 ---
 
-## 四、终端发起的剪贴板读写请求
+## 五、终端发起的剪贴板请求（OSC 52）
 
-这是终端程序（如 vim、tmux）通过转义序列（OSC 52）主动操作剪贴板的机制。
+### 5.1 整体架构
 
-### 4.1 整体流程
+终端程序（如 vim、tmux）可以通过 OSC 52 转义序列主动操作剪贴板。终端核心层只发事件，不直接访问剪贴板（保持平台无关）。
 
 ```
-终端程序发送 OSC 52 转义序列
+终端程序（vim/tmux）
+    │
+    │  发送 \x1b]52;c;<base64>\x07 (写) 或 \x1b]52;c;?\x07 (读)
+    ▼
+VTE 解析器
     │
     ▼
-VTE 解析 → 调用 term 的 clipboard_store/load 方法
+term/mod.rs: clipboard_store/load()
     │
+    │  检查 osc52 配置权限
+    │  发送 Event::ClipboardStore / ClipboardLoad
     ▼
-终端层：检查 osc52 配置权限
+event.rs: 事件循环处理
     │
-    ▼
-发送 Event::ClipboardStore / ClipboardLoad 事件
-    │
-    ▼
-UI 层事件循环处理事件
-    │
-    ├─ Store：调用 clipboard.store(ty, content)
-    └─ Load：调用 clipboard.load(ty)，然后将结果写回 PTY
+    ├─ Store → clipboard.store(ty, content)
+    └─ Load → clipboard.load(ty) → 格式化为 OSC 52 回写 → write_to_pty
 ```
 
-### 4.2 剪贴板写入（终端 → 剪贴板）
+### 5.2 剪贴板写入（终端 → 剪贴板）
 
-**触发**：终端程序发送 OSC 52 序列，如 `\x1b]52;c;<base64编码内容>\x07`
+**触发序列：** `\x1b]52;c;<base64内容>\x07`
 
 **处理流程：**
 
-1. 终端层接收并解码：[term/mod.rs#L1705-L1721](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1705-L1721)
+1. 终端层接收：[term/mod.rs#L1705-L1721](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty_terminal/src/term/mod.rs#L1705-L1721)
    ```rust
    fn clipboard_store(&mut self, clipboard: u8, base64: &[u8]) {
        // 权限检查
@@ -225,7 +381,7 @@ UI 层事件循环处理事件
            _ => return,
        };
        
-       // Base64 解码
+       // Base64 解码后发送事件
        if let Ok(bytes) = Base64.decode(base64) {
            if let Ok(text) = String::from_utf8(bytes) {
                self.event_proxy.send_event(Event::ClipboardStore(clipboard_type, text));
@@ -234,23 +390,18 @@ UI 层事件循环处理事件
    }
    ```
 
-2. UI 层处理事件：[event.rs#L1902-L1905](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L1902-L1905)
+2. UI 层处理：[event.rs#L1902-L1905](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L1902-L1905)
    ```rust
    TerminalEvent::ClipboardStore(clipboard_type, content) => {
-       if self.ctx.terminal.is_focused {
+       if self.ctx.terminal.is_focused {  // 安全检查：只有焦点窗口才执行
            self.ctx.clipboard.store(clipboard_type, content);
        }
    },
    ```
 
-**安全机制：**
-- `osc52` 配置控制权限：`OnlyCopy` / `OnlyPaste` / `CopyPaste` / `Disabled`
-- 只有窗口获得焦点时才执行写入
-- 内容通过 Base64 编码传输
+### 5.3 剪贴板读取（剪贴板 → 终端）
 
-### 4.3 剪贴板读取（剪贴板 → 终端）
-
-**触发**：终端程序发送 OSC 52 读取序列，如 `\x1b]52;c;?\x07`
+**触发序列：** `\x1b]52;c;?\x07`
 
 **处理流程：**
 
@@ -262,6 +413,7 @@ UI 层事件循环处理事件
            return;
        }
        
+       // 发送事件，附带格式化闭包
        self.event_proxy.send_event(Event::ClipboardLoad(
            clipboard_type,
            Arc::new(move |text| {
@@ -282,114 +434,61 @@ UI 层事件循环处理事件
    },
    ```
 
-**设计特点：**
-- 终端层只发请求，不直接访问剪贴板（保持平台无关）
-- 通过 `Arc<dyn Fn(&str) -> String>` 闭包传递格式化逻辑
-- 结果作为转义序列写回 PTY，终端程序接收后自行处理
+### 5.4 安全机制
 
-### 4.4 OSC 52 剪贴板类型映射
+1. **配置权限**：`osc52` 选项控制
+   - `Disabled`：完全禁止
+   - `OnlyCopy`：只允许写入
+   - `OnlyPaste`：只允许读取
+   - `CopyPaste`：双向允许
 
-| OSC 52 字符 | ClipboardType | 含义 |
-|------------|---------------|------|
-| `'c'` | Clipboard | 系统剪贴板 |
-| `'p'` / `'s'` | Selection | X11 主选区 |
+2. **焦点检查**：只有窗口获得焦点时才执行，防止后台终端窃取剪贴板
 
-### 4.5 与用户复制的对比
+3. **内容编码**：Base64 编码传输，避免特殊字符问题
 
-| 维度 | 用户复制（Copy 动作） | OSC 52 终端写入 |
-|------|----------------------|-----------------|
-| 触发方 | 用户 | 终端程序 |
-| 数据源 | 终端选区内容 | 转义序列中的 Base64 |
-| 权限控制 | 无（用户主动操作） | `osc52` 配置 + 焦点检查 |
-| 写入目标 | 根据 Action 类型决定 | 根据转义序列参数决定 |
+### 5.5 与用户复制/粘贴的对比
 
----
-
-## 五、完整的状态流转图
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                        选区状态流转                             │
-└───────────────────────────────────────────────────────────────┘
-
-None (无选区)
-  │
-  ├─ 鼠标单击 / 双击 / 三击 / Ctrl+单击
-  │  start_selection(ty, point, side)
-  ▼
-Some(Selection)  ←───────┐
-  │                      │
-  ├─ 鼠标拖动            │
-  │  update_selection()  │
-  ▼                      │
-选区范围更新             │
-  │                      │
-  ├─ 鼠标释放            │
-  │  copy_selection(Selection)  │
-  │  （选区仍保留）       │
-  │                      │
-  ├─ VI 模式光标移动      │
-  │  vi_mode_recompute_selection()
-  ▼                      │
-选区自动扩展             │
-  │                      │
-  └─ 清除触发 ───────────┘
-     clear_selection() → None
-       │
-       ├─ 点击空白处
-       ├─ 列数变化
-       ├─ 切换 alt screen
-       ├─ 清屏 / 重置
-       ├─ 内容变化（行清除等）
-       └─ 显式 ClearSelection 动作
-
-┌───────────────────────────────────────────────────────────────┐
-│                       剪贴板数据流                              │
-└───────────────────────────────────────────────────────────────┘
-
-  选区文本 ──copy_selection()──▶ 剪贴板
-                                (Selection 或 Clipboard)
-
-  剪贴板 ────load() + paste()──▶ PTY（终端进程）
-  (用户触发粘贴)
-
-  终端进程 ──OSC 52 Store──▶ 剪贴板
-  (通过转义序列)
-
-  剪贴板 ───OSC 52 Load───▶ 终端进程
-  (通过转义序列回写)
-```
+| 维度 | 用户复制 | OSC 52 写入 | 用户粘贴 | OSC 52 读取 |
+|------|----------|-------------|----------|-------------|
+| 触发方 | 用户 | 终端程序 | 用户 | 终端程序 |
+| 数据源 | 选区内容 | 转义序列 | 剪贴板 | 剪贴板 |
+| 目标 | 剪贴板 | 剪贴板 | PTY | PTY |
+| 权限 | 无 | osc52 + 焦点 | 无 | osc52 + 焦点 |
+| 数据格式 | 纯文本 | Base64 编码 | 纯文本 | Base64 编码后封装为 OSC |
 
 ---
 
-## 六、关键边界与注意事项
+## 六、关键边界与设计权衡
 
-### 6.1 Selection 剪贴板的平台差异
+### 6.1 相交即丢弃的设计选择
 
-- **X11/Wayland**：有独立的 Selection 剪贴板（PRIMARY）
-- **macOS/Windows**：没有 Selection 剪贴板，selection 字段为 `None`
-  - `store(Selection)` 时直接返回（不写入任何地方）
-  - `load(Selection)` 时回退到系统剪贴板（走 `_` 分支）
+为什么内容变化时采用「相交即整体丢弃」而不是裁剪？
 
-### 6.2 save_to_clipboard 配置
+- **简单高效**：行级相交判断 O(1)，裁剪需要复杂的范围计算
+- **避免不一致**：如果只清除部分行，保留的选区可能与实际内容错位
+- **用户预期**：内容变化后，原来的选区语义上已失效
 
-当 `selection.save_to_clipboard = true` 时，复制到 Selection 类型时会**同时复制到系统剪贴板**：[event.rs#L750-L752](file:///d:/fz/0601/solo-dogfeeding/code/341-alacritty/alacritty/src/event.rs#L750-L752)
+代价：用户体验上偶尔会出现「我只清除了一行，怎么整个选区都没了」的困惑。
 
-```rust
-if ty == ClipboardType::Selection && self.config.selection.save_to_clipboard {
-    self.clipboard.store(ClipboardType::Clipboard, text.clone());
-}
-```
+### 6.2 滚动时裁剪的合理性
 
-### 6.3 空选择的特殊处理
+滚动时内容只是位置移动，没有实际清除，所以：
+- 选区应该跟随内容移动
+- 部分滚出时裁剪到边界是合理的
+- 完全滚出后丢弃也是合理的
+
+### 6.3 OSC 52 的分层设计
+
+终端核心层不直接访问剪贴板：
+- 保持终端层平台无关，可独立测试
+- 安全检查（焦点、配置）在 UI 层统一处理
+- 通过事件和闭包传递格式化逻辑，解耦层间依赖
+
+### 6.4 空选择的处理
 
 选择可以处于「存在但为空」的状态：
 - `is_empty()` 返回 true
-- `copy_selection()` 会跳过，不执行复制
-- `clear_selection()` 不会标记 dirty（无需重绘）
+- `copy_selection()` 跳过不执行
+- `clear_selection()` 不标记 dirty
 
-典型场景：鼠标刚按下还没拖动时。
-
-### 6.4 焦点安全检查
-
-OSC 52 剪贴板操作有焦点检查：只有终端窗口获得焦点时才执行。这是安全措施，防止后台终端程序随意读写用户剪贴板。
+这种设计避免了频繁创建销毁 `Option<Selection>`，保持选择对象的连续性。
