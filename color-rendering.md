@@ -99,7 +99,7 @@ pub struct List([Rgb; COUNT]);  // COUNT = 269
 impl From<&'_ Colors> for List {
     fn from(colors: &Colors) -> List {
         let mut list = List([Rgb::default(); COUNT]);
-        list.fill_named(colors);     // 填充命名色（0-15, 256-268）
+        list.fill_named(colors);     // 填充配置直接定义的命名色（不含 Cursor / DimBackground）
         list.fill_cube(colors);      // 填充颜色立方体（16-231）
         list.fill_gray_ramp(colors); // 填充灰度（232-255）
         list
@@ -107,7 +107,26 @@ impl From<&'_ Colors> for List {
 }
 ```
 
-**Dim 颜色计算策略**（[fill_named](alacritty/src/display/color.rs#L34-L89)）：
+### fill_named 实际填充的槽位
+
+位于 [fill_named](alacritty/src/display/color.rs#L34-L89)，实际写入的命名色分组如下：
+
+| 分组 | 命名色 | 数量 |
+|------|--------|-----|
+| Normals | Black, Red, Green, Yellow, Blue, Magenta, Cyan, White | 8 |
+| Brights | BrightBlack..BrightWhite | 8 |
+| Bright foreground | BrightForeground | 1 |
+| Foreground/Background | Foreground, Background | 2 |
+| Dims | DimForeground, DimBlack..DimWhite | 9 |
+
+**未被 fill_named 填充的命名色槽位**：
+
+| 槽位索引 | 命名色 | 说明 |
+|---------|--------|------|
+| 258 | Cursor | 光标颜色不进入配置转换；显示层使用时优先读取终端层 `term.colors[Cursor]`，没有则回退到配置 `config.colors.cursor` |
+| 268 | DimBackground | 终端调色板注释中预留的暗背景槽位；当前代码没有在 `fill_named` 中写入，也没有在渲染路径中引用 |
+
+**Dim 颜色计算策略**：
 - 如果配置了 `dim` 字段，使用配置值
 - 否则，使用 `DIM_FACTOR = 0.66` 乘以 normal 颜色自动计算
 
@@ -117,17 +136,35 @@ impl From<&'_ Colors> for List {
 
 ### 3.1 终端调色板：`term::color::Colors`
 
-位于 [alacritty_terminal/src/term/color.rs](alacritty_terminal/src/term/color.rs#L21-L22)
+位于 [alacritty_terminal/src/term/color.rs](alacritty_terminal/src/term/color.rs#L8-L21)
 
 ```rust
 pub struct Colors([Option<Rgb>; COUNT]);  // COUNT = 269
 ```
 
+终端调色板的 269 个槽位定义（来自源码注释）：
+
+| 索引范围 | 描述 |
+| -------- | ---- |
+| 0..16 | 命名 ANSI 颜色 |
+| 16..232 | 颜色立方体 |
+| 233..256 | 灰度渐变 |
+| 256 | Foreground |
+| 257 | Background |
+| 258 | Cursor |
+| 259..267 | Dim 颜色（半开区间，8 个槽位） |
+| 267 | Bright foreground |
+| 268 | Dim background |
+
 与 `display::color::List` 结构相同，但存储的是 `Option<Rgb>`：
-- `None`：使用默认颜色（即配置文件中的颜色）
+- `None`：使用默认颜色（回退到显示层 `display.colors` 即配置值）
 - `Some(rgb)`：被 OSC 4/10/11 等转义序列动态修改过的颜色
 
 这样设计的目的是让终端运行时可以动态修改颜色，同时保留配置中的默认值作为回退。
+
+**终端调色板与显示列表的槽位差异**：
+- **258 (Cursor)**：两端都存在，但显示层 `fill_named` 不填充它。光标颜色在终端层通过 OSC 动态设置（[alacritty_terminal/src/term/mod.rs](alacritty_terminal/src/term/mod.rs#L1666)），显示层使用时优先读取终端层的值，没有则回退到配置 `config.colors.cursor`（[alacritty/src/display/content.rs](alacritty/src/display/content.rs#L120-L121)）。
+- **268 (DimBackground)**：仅在终端调色板注释中预留；当前代码没有在显示层 `fill_named` 中写入，也没有在渲染路径中引用。
 
 ### 3.2 终端单元格：`term::cell::Cell`
 
