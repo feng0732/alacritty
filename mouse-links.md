@@ -420,18 +420,22 @@ let cells = grid_cells.into_iter().map(|mut cell| {
 
 ### 5.1 核心防误触变量
 
-**`block_hint_launcher`**：定义在 `alacritty/src/event.rs` 的 [Mouse](alacritty/src/event.rs#L1768-L1782) 结构体中。
+**`block_hint_launcher`**：定义在 `alacritty/src/event.rs` 的 [Mouse](alacritty/src/event.rs#L1768-L1782) 结构体中，实际检查位置在 `alacritty/src/event.rs` 的 [ActionContext::trigger_hint()](alacritty/src/event.rs#L1235) 第一行（**第一道防线**）。
 
 ```rust
-pub struct Mouse {
-    // ...
-    pub block_hint_launcher: bool,  // 阻止提示启动器
-    pub hint_highlight_dirty: bool, // 提示高亮脏标记
-    // ...
+fn trigger_hint(&mut self, hint: &HintMatch) {
+    if self.mouse.block_hint_launcher {  // ⚠️ 第一道防线，真正的总闸门在这里！
+        return;
+    }
+    // ... 然后才是 hint.text() 实时验证（第二道防线）
 }
 ```
 
-**作用**：作为超链接触发的总闸门——即使鼠标下方有高亮的超链接，只要 `block_hint_launcher = true`，点击也不会触发。
+**作用**：作为超链接触发的总闸门——即使 `on_mouse_release()` 中左键释放且有高亮，只要进入 `trigger_hint()` 后发现 `block_hint_launcher = true`，就会立即返回，不执行任何动作。
+
+**⚠️ 职责边界澄清**：
+- [alacritty/src/input/mod.rs - on_mouse_release()](alacritty/src/input/mod.rs#L696-L723)：只检查「是否左键释放」和「是否有高亮」，**不检查** `block_hint_launcher`
+- [alacritty/src/event.rs - trigger_hint()](alacritty/src/event.rs#L1234-L1275)：真正执行触发逻辑，第一行就检查 `block_hint_launcher`
 
 ### 5.2 各场景下的状态变化
 
@@ -569,15 +573,15 @@ Action::Vi(ViAction::Open) => {
 5. ✅ 非鼠标模式，或鼠标模式下按住 Shift
 6. ✅ 当前点命中了超链接或正则匹配
 
-#### 第二层：点击触发条件（在 on_mouse_release 中检查）
+#### 第二层：点击触发条件
 
-7. ✅ 是鼠标左键释放（`button == MouseButton::Left`）
-8. ✅ `highlighted_hint` 不为 None
-9. ✅ `block_hint_launcher == false`
+7. ✅ 是鼠标左键释放（`button == MouseButton::Left`）——在 [alacritty/src/input/mod.rs#L711](alacritty/src/input/mod.rs#L711) 中检查
+8. ✅ `highlighted_hint` 不为 None——在 [alacritty/src/input/mod.rs#L710-L711](alacritty/src/input/mod.rs#L710-L711) 中检查
+9. ✅ `block_hint_launcher == false`——在 [alacritty/src/event.rs#L1235](alacritty/src/event.rs#L1235) 中检查（**真正的总闸门位置**）
 
-#### 第三层：实时验证条件（在 trigger_hint -> text() 中检查）
+#### 第三层：实时验证条件（在 trigger_hint 内部调用 text() 时检查）
 
-10. ✅ 超链接/正则匹配在触发时仍然有效（`HintMatch::text()` 重新验证）
+10. ✅ 超链接/正则匹配在触发时仍然有效——在 [alacritty/src/display/hint.rs#L234-L249](alacritty/src/display/hint.rs#L234-L249) 中通过 `HintMatch::text()` 重新验证
 
 **只要任何一个条件不满足，超链接就不会触发。**
 
@@ -602,13 +606,14 @@ winit MouseInput (Released)
 alacritty/src/input/mod.rs - Processor::mouse_input()
     ├─ 更新按钮状态
     └─ on_mouse_release(button)
-        ├─ 鼠标模式处理
+        ├─ 鼠标模式处理（非 Shift 则报告事件并返回）
         ├─ 取出 highlighted_hint
-        ├─ 检查：左键 && block_hint_launcher == false
-        │   └─ 满足则调用 trigger_hint(hint)
-        │       ├─ 检查 block_hint_launcher（第一道防线）
+        ├─ 检查：左键按钮（button == Left）
+        │   └─ 满足则调用 alacritty/src/event.rs - ActionContext::trigger_hint()
+        │       ├─ 检查 block_hint_launcher（第一道防线，第一行就检查）
         │       ├─ hint.text() 重新验证匹配（第二道防线）
         │       └─ 执行动作（打开/复制/粘贴/选择/移动）
+        ├─ 恢复 highlighted_hint
         └─ copy_selection()
 ```
 
@@ -790,12 +795,12 @@ alacritty/src/config/ui_config.rs - Hint
    ↓
 2. alacritty/src/input/mod.rs - Processor::mouse_input()
    ↓
-3. on_mouse_release(button)
+3. alacritty/src/input/mod.rs - Processor::on_mouse_release(button)
+   ├─ 检查：非鼠标模式或按住 Shift（否则报告鼠标事件并返回）
    ├─ 取出 highlighted_hint
-   ├─ 检查：左键按钮
-   ├─ 检查：block_hint_launcher == false
+   ├─ 检查：左键按钮（button == MouseButton::Left）
    └─ 调用 alacritty/src/event.rs - ActionContext::trigger_hint()
-      ├─ 再次检查 block_hint_launcher（第一道防线）
+      ├─ 检查 block_hint_launcher == false（第一道防线，第一行就检查）
       ├─ hint.text() 重新验证匹配（第二道防线）
       │   ├─ 超链接类型：重新调用 hyperlink_at()
       │   └─ 正则类型：重新调用 regex_match_at()
@@ -837,7 +842,7 @@ alacritty/src/config/ui_config.rs - Hint
 
 ### 9.2 安全设计（防误触）
 
-1. **`block_hint_launcher` 总闸门**：防止拖动、双击、三击时误触发超链接
+1. **`block_hint_launcher` 总闸门**：在 [alacritty/src/event.rs#L1235](alacritty/src/event.rs#L1235) 的 `trigger_hint()` 第一行检查，防止拖动、双击、三击时误触发超链接（**注意**：`on_mouse_release()` 不检查此标志，只检查左键按钮）
 2. **选区存在清除高亮**：有选区时不显示高亮，避免选区和高亮混淆
 3. **实时验证**：`HintMatch::text()` 在触发前重新验证匹配有效性，防止终端内容变化后点击到错误内容
 4. **修饰键前置检查**：鼠标模式下必须按住 Shift，防止与终端内鼠标事件冲突
