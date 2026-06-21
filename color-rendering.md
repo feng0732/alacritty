@@ -27,7 +27,7 @@ GPU 文本实例数据 (InstanceData)             线条收集 (RenderLines)
 
 ### 核心结构体：`Colors`
 
-位于 [alacritty/src/config/color.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/config/color.rs#L8-L24)
+位于 [alacritty/src/config/color.rs](alacritty/src/config/color.rs#L8-L24)
 
 这是用户配置层的颜色主题入口，从配置文件 (alacritty.toml) 反序列化而来。
 
@@ -69,7 +69,7 @@ pub struct Colors {
 
 ### 核心结构体：`List`
 
-位于 [alacritty/src/display/color.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/color.rs#L18-L19)
+位于 [alacritty/src/display/color.rs](alacritty/src/display/color.rs#L18-L19)
 
 ```rust
 pub struct List([Rgb; COUNT]);  // COUNT = 269
@@ -81,19 +81,19 @@ pub struct List([Rgb; COUNT]);  // COUNT = 269
 
 | 索引范围 | 描述 |
 |---------|------|
-| 0..16 | 命名 ANSI 颜色（normal + bright） |
+| 0..16 | 命名 ANSI 颜色（normal + bright，共 16 个） |
 | 16..232 | 6×6×6 颜色立方体（216 色） |
 | 232..256 | 灰度渐变（24 级） |
 | 256 | Foreground（前景色） |
 | 257 | Background（背景色） |
 | 258 | Cursor（光标色） |
-| 259..267 | Dim 暗色（9 个） |
-| 267 | Bright foreground |
-| 268 | Dim background |
+| 259..267 | Dim 暗色（8 个，半开区间不含右端） |
+| 267 | Bright foreground（亮前景） |
+| 268 | Dim background（暗背景） |
 
 ### 从配置到 List 的转换
 
-位于 [List::from](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/color.rs#L21-L32)：
+位于 [List::from](alacritty/src/display/color.rs#L21-L32)：
 
 ```rust
 impl From<&'_ Colors> for List {
@@ -107,7 +107,7 @@ impl From<&'_ Colors> for List {
 }
 ```
 
-**Dim 颜色计算策略**（[fill_named](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/color.rs#L34-L89)）：
+**Dim 颜色计算策略**（[fill_named](alacritty/src/display/color.rs#L34-L89)）：
 - 如果配置了 `dim` 字段，使用配置值
 - 否则，使用 `DIM_FACTOR = 0.66` 乘以 normal 颜色自动计算
 
@@ -117,7 +117,7 @@ impl From<&'_ Colors> for List {
 
 ### 3.1 终端调色板：`term::color::Colors`
 
-位于 [alacritty_terminal/src/term/color.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty_terminal/src/term/color.rs#L21-L22)
+位于 [alacritty_terminal/src/term/color.rs](alacritty_terminal/src/term/color.rs#L21-L22)
 
 ```rust
 pub struct Colors([Option<Rgb>; COUNT]);  // COUNT = 269
@@ -131,7 +131,7 @@ pub struct Colors([Option<Rgb>; COUNT]);  // COUNT = 269
 
 ### 3.2 终端单元格：`term::cell::Cell`
 
-位于 [alacritty_terminal/src/term/cell.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty_terminal/src/term/cell.rs#L134-L140)
+位于 [alacritty_terminal/src/term/cell.rs](alacritty_terminal/src/term/cell.rs#L134-L140)
 
 ```rust
 pub struct Cell {
@@ -159,7 +159,7 @@ pub enum Color {
 
 ### 3.4 单元格样式标志：`Flags`
 
-位于 [alacritty_terminal/src/term/cell.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty_terminal/src/term/cell.rs#L12-L36)
+位于 [alacritty_terminal/src/term/cell.rs](alacritty_terminal/src/term/cell.rs#L12-L36)
 
 使用 bitflags 表示单元格的文本样式。Flags 按渲染管线分组如下：
 
@@ -196,7 +196,7 @@ pub enum Color {
 
 ### 4.1 `RenderableContent`
 
-位于 [alacritty/src/display/content.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/content.rs#L27-L38)
+位于 [alacritty/src/display/content.rs](alacritty/src/display/content.rs#L27-L38)
 
 ```rust
 pub struct RenderableContent<'a> {
@@ -211,7 +211,7 @@ pub struct RenderableContent<'a> {
 
 ### 4.2 `RenderableCell`
 
-位于 [alacritty/src/display/content.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/content.rs#L188-L198)
+位于 [alacritty/src/display/content.rs](alacritty/src/display/content.rs#L188-L198)
 
 ```rust
 pub struct RenderableCell {
@@ -228,11 +228,11 @@ pub struct RenderableCell {
 
 ### 4.3 颜色计算流程
 
-颜色计算发生在 `RenderableCell::new` 中（[content.rs:209-299](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/content.rs#L209-L299)），按以下顺序进行：
+颜色计算发生在 `RenderableCell::new` 中（[content.rs:209-299](alacritty/src/display/content.rs#L209-L299)），按以下顺序进行：
 
 #### 步骤 1：基础前景色计算
 
-[compute_fg_rgb](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/content.rs#L326-L370)
+[compute_fg_rgb](alacritty/src/display/content.rs#L326-L370)
 
 ```rust
 fn compute_fg_rgb(content: &RenderableContent<'_>, fg: Color, flags: Flags) -> Rgb {
@@ -261,7 +261,7 @@ fn compute_fg_rgb(content: &RenderableContent<'_>, fg: Color, flags: Flags) -> R
 
 #### 步骤 2：基础背景色计算
 
-[compute_bg_rgb](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/content.rs#L373-L380)
+[compute_bg_rgb](alacritty/src/display/content.rs#L373-L380)
 
 ```rust
 fn compute_bg_rgb(content: &RenderableContent<'_>, bg: Color) -> Rgb {
@@ -303,7 +303,7 @@ fn compute_cell_rgb(cell_fg, cell_bg, bg_alpha, fg: CellRgb, bg: CellRgb) {
 
 #### 步骤 5：透明度计算
 
-[compute_bg_alpha](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/content.rs#L388-L396)
+[compute_bg_alpha](alacritty/src/display/content.rs#L388-L396)
 
 - 如果背景是 `Color::Named(NamedColor::Background)`（默认背景色），alpha = 0（不绘制背景）
 - 如果启用 `transparent_background_colors`，使用窗口透明度
@@ -319,7 +319,7 @@ fn compute_cell_rgb(cell_fg, cell_bg, bg_alpha, fg: CellRgb, bg: CellRgb) {
 
 ### 5.0 绘制总流程总览
 
-位于 [alacritty/src/display/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/mod.rs#L775-L1009)
+位于 [alacritty/src/display/mod.rs](alacritty/src/display/mod.rs#L775-L1009)
 
 ```rust
 pub fn draw<T: EventListener>(&mut self, ...) {
@@ -361,7 +361,7 @@ pub fn draw<T: EventListener>(&mut self, ...) {
 
 #### 5.1.1 渲染器架构
 
-位于 [alacritty/src/renderer/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/mod.rs#L89-L93)
+位于 [alacritty/src/renderer/mod.rs](alacritty/src/renderer/mod.rs#L89-L93)
 
 ```rust
 pub struct Renderer {
@@ -384,7 +384,7 @@ Renderer::draw_cells
 
 #### 5.1.3 文本渲染中 Flags 处理
 
-位于 [alacritty/src/renderer/text/mod.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/text/mod.rs#L134-L173)
+位于 [alacritty/src/renderer/text/mod.rs](alacritty/src/renderer/text/mod.rs#L134-L173)
 
 ```rust
 fn draw_cell(&mut self, mut cell: RenderableCell, glyph_cache: &mut GlyphCache, size_info: &SizeInfo) {
@@ -419,7 +419,7 @@ fn draw_cell(&mut self, mut cell: RenderableCell, glyph_cache: &mut GlyphCache, 
 
 #### 5.1.4 GPU 实例数据：`InstanceData`
 
-位于 [alacritty/src/renderer/text/glsl3.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/text/glsl3.rs#L284-L318)
+位于 [alacritty/src/renderer/text/glsl3.rs](alacritty/src/renderer/text/glsl3.rs#L284-L318)
 
 ```rust
 #[repr(C)]
@@ -458,7 +458,7 @@ self.instances.push(InstanceData {
 
 #### 5.2.1 线条收集：`RenderLines`
 
-位于 [alacritty/src/renderer/rects.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L158-L227)
+位于 [alacritty/src/renderer/rects.rs](alacritty/src/renderer/rects.rs#L158-L227)
 
 ```rust
 pub struct RenderLines {
@@ -466,7 +466,7 @@ pub struct RenderLines {
 }
 ```
 
-**线条收集过程**（[update](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L180-L189)）：
+**线条收集过程**（[update](alacritty/src/renderer/rects.rs#L180-L189)）：
 
 ```rust
 pub fn update(&mut self, cell: &RenderableCell) {
@@ -479,7 +479,7 @@ pub fn update(&mut self, cell: &RenderableCell) {
 }
 ```
 
-**单个标志更新逻辑**（[update_flag](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L191-L226)）：
+**单个标志更新逻辑**（[update_flag](alacritty/src/renderer/rects.rs#L191-L226)）：
 
 ```rust
 fn update_flag(&mut self, cell: &RenderableCell, flag: Flags) {
@@ -517,7 +517,7 @@ fn update_flag(&mut self, cell: &RenderableCell, flag: Flags) {
 
 #### 5.2.2 线段数据结构：`RenderLine`
 
-位于 [alacritty/src/renderer/rects.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L36-L41)
+位于 [alacritty/src/renderer/rects.rs](alacritty/src/renderer/rects.rs#L36-L41)
 
 ```rust
 pub struct RenderLine {
@@ -529,7 +529,7 @@ pub struct RenderLine {
 
 #### 5.2.3 线段转矩形：`RenderLine::rects`
 
-位于 [alacritty/src/renderer/rects.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L54-L119)
+位于 [alacritty/src/renderer/rects.rs](alacritty/src/renderer/rects.rs#L54-L119)
 
 ```rust
 pub fn rects(&self, flag: Flags, metrics: &Metrics, size: &SizeInfo) -> Vec<RenderRect> {
@@ -558,7 +558,7 @@ pub fn rects(&self, flag: Flags, metrics: &Metrics, size: &SizeInfo) -> Vec<Rend
 }
 ```
 
-**位置计算公式**（[create_rect](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L121-L156)）：
+**位置计算公式**（[create_rect](alacritty/src/renderer/rects.rs#L121-L156)）：
 
 ```rust
 fn create_rect(...) -> RenderRect {
@@ -583,7 +583,7 @@ fn create_rect(...) -> RenderRect {
 
 #### 5.2.4 矩形类型：`RectKind`
 
-位于 [alacritty/src/renderer/rects.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L43-L52)
+位于 [alacritty/src/renderer/rects.rs](alacritty/src/renderer/rects.rs#L43-L52)
 
 ```rust
 #[repr(u8)]
@@ -600,7 +600,7 @@ pub enum RectKind {
 
 #### 5.2.5 矩形渲染器：`RectRenderer`
 
-位于 [alacritty/src/renderer/rects.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L247-L398)
+位于 [alacritty/src/renderer/rects.rs](alacritty/src/renderer/rects.rs#L247-L398)
 
 ```rust
 pub struct RectRenderer {
@@ -611,7 +611,7 @@ pub struct RectRenderer {
 }
 ```
 
-**矩形绘制流程**（[draw](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L320-L370)）：
+**矩形绘制流程**（[draw](alacritty/src/renderer/rects.rs#L320-L370)）：
 
 ```rust
 pub fn draw(&mut self, size_info: &SizeInfo, metrics: &Metrics, rects: Vec<RenderRect>) {
@@ -642,7 +642,7 @@ pub fn draw(&mut self, size_info: &SizeInfo, metrics: &Metrics, rects: Vec<Rende
 
 #### 5.2.6 光标矩形转换：`IntoRects`
 
-位于 [alacritty/src/display/cursor.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/cursor.rs#L11-L90)
+位于 [alacritty/src/display/cursor.rs](alacritty/src/display/cursor.rs#L11-L90)
 
 ```rust
 pub trait IntoRects {
@@ -685,7 +685,7 @@ impl IntoRects for RenderableCursor {
 
 #### 6.1.2 片段着色器 (text.f.glsl)
 
-位于 [alacritty/res/glsl3/text.f.glsl](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/res/glsl3/text.f.glsl)
+位于 [alacritty/res/glsl3/text.f.glsl](alacritty/res/glsl3/text.f.glsl)
 
 多通道渲染，通过 `renderingPass` 控制：
 
@@ -717,7 +717,7 @@ void main() {
 
 #### 6.2.1 顶点着色器 (rect.v.glsl)
 
-位于 [alacritty/res/rect.v.glsl](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/res/rect.v.glsl)
+位于 [alacritty/res/rect.v.glsl](alacritty/res/rect.v.glsl)
 
 ```glsl
 void main() {
@@ -730,7 +730,7 @@ void main() {
 
 #### 6.2.2 片段着色器 (rect.f.glsl)
 
-位于 [alacritty/res/rect.f.glsl](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/res/rect.f.glsl)
+位于 [alacritty/res/rect.f.glsl](alacritty/res/rect.f.glsl)
 
 4 种绘制模式通过 `#define` 控制：
 
@@ -800,7 +800,7 @@ void main() {
 
 #### 6.2.3 着色器编译时选择
 
-位于 [alacritty/src/renderer/rects.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/renderer/rects.rs#L437-L446)
+位于 [alacritty/src/renderer/rects.rs](alacritty/src/renderer/rects.rs#L437-L446)
 
 ```rust
 impl RectShaderProgram {
@@ -883,7 +883,7 @@ Display::draw()
 
 ### 颜色查找回退机制
 
-在 [RenderableContent::color](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/src/display/content.rs#L104-L106) 中：
+在 [RenderableContent::color](alacritty/src/display/content.rs#L104-L106) 中：
 
 ```rust
 pub fn color(&self, color: usize) -> Rgb {
