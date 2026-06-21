@@ -2,7 +2,7 @@
 
 ## 概述
 
-Alacritty 的颜色系统从配置到最终 GPU 渲染输出，经历了 **6 个核心层次** 的转换。同时，**单元格样式（Flags）分为两条并行的渲染管线：**文本绘制管线**和**矩形绘制管线**。
+Alacritty 的颜色系统从配置到最终 GPU 渲染输出，经历了 **6 个核心层次** 的转换。同时，单元格样式（Flags）分为两条并行的渲染管线——**文本绘制管线**和**矩形绘制管线**。
 
 ```
 配置层 (config::Colors)
@@ -161,7 +161,7 @@ pub enum Color {
 
 位于 [alacritty_terminal/src/term/cell.rs](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty_terminal/src/term/cell.rs#L12-L36)
 
-使用 bitflags 表示单元格的文本样式。**Flags 分为两条渲染管线：
+使用 bitflags 表示单元格的文本样式。Flags 按渲染管线分组如下：
 
 #### 文本绘制管线处理的 Flags：
 
@@ -409,12 +409,12 @@ fn draw_cell(&mut self, mut cell: RenderableCell, glyph_cache: &mut GlyphCache, 
 }
 ```
 
-**文本渲染中处理的 Flags：
+**文本渲染中处理的 Flags**：
 - `BOLD`/`ITALIC`/`BOLD_ITALIC` → 选择不同字体
 - `HIDDEN` → 替换为空格
 - `WIDE_CHAR` → 标记到 `RenderingGlyphFlags::WIDE_CHAR`
 
-**文本渲染中**不**处理的 Flags：
+**文本渲染中不处理的 Flags**：
 - `UNDERLINE`/`STRIKEOUT`/`UNDERCURL` 等线条样式 → 由矩形管线处理
 
 #### 5.1.4 GPU 实例数据：`InstanceData`
@@ -513,7 +513,7 @@ fn update_flag(&mut self, cell: &RenderableCell, flag: Flags) {
 }
 ```
 
-**合并优化**：相邻、同色、同样式、同行的单元格会被合并为一条 `RenderLine`，减少绘制数量。
+**合并优化**：相邻、同色、同样式、同行的单元格会被合并为一条 `RenderLine`，从而减少生成的 `RenderRect` 数量和上传到 GPU 的顶点数据量。矩形渲染器按 `RectKind` 分组后，每组仅调用一次 `glDrawArrays`，draw call 数量恒为 ≤4，与合并无关。
 
 #### 5.2.2 线段数据结构：`RenderLine`
 
@@ -732,7 +732,7 @@ void main() {
 
 位于 [alacritty/res/rect.f.glsl](file:///d:/fz/0601-2/solo-dogfeeding/code/119-alacritty/alacritty/res/rect.f.glsl)
 
-**4 种绘制模式通过 `#define` 控制：
+4 种绘制模式通过 `#define` 控制：
 
 ```glsl
 // 波浪线绘制函数
@@ -912,7 +912,7 @@ pub fn color(&self, color: usize) -> Rgb {
    - **矩形管线**处理装饰线条（下划线/删除线/波浪线等）
    - 分离关注点，各自优化
 
-5. **RenderLines 合并优化**：连续同色同样式的单元格合并为单条线段，减少 draw call
+5. **RenderLines 合并优化**：连续同色同样式的单元格合并为单条线段，减少 `RenderRect` 数量和上传到 GPU 的顶点数据量（矩形渲染器的 draw call 数量恒为 ≤4，与合并无关）
 
 6. **4 种 RectKind 对应 4 个预编译着色器**：通过 `#define` 控制绘制逻辑，避免运行时分支
 
