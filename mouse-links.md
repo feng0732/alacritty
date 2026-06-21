@@ -41,7 +41,7 @@ Alacritty 涉及三套坐标系统：
 
 ### 2.2 像素 → 单元格换算
 
-**核心函数**：`alacritty/src/event.rs` 中的 [Mouse::point()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/event.rs#L1810-L1818)
+**核心函数**：`alacritty/src/event.rs` 中的 [Mouse::point()](alacritty/src/event.rs#L1810-L1818)
 
 ```rust
 pub fn point(&self, size: &SizeInfo, display_offset: usize) -> Point {
@@ -67,7 +67,7 @@ pub fn point(&self, size: &SizeInfo, display_offset: usize) -> Point {
 
 ### 2.3 视口坐标 ↔ 网格坐标转换
 
-**核心函数**：`alacritty_terminal/src/term/mod.rs` 中的 [viewport_to_point()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty_terminal/src/term/mod.rs#L131-L134)
+**核心函数**：`alacritty_terminal/src/term/mod.rs` 中的 [viewport_to_point()](alacritty_terminal/src/term/mod.rs#L131-L134)
 
 ```rust
 pub fn viewport_to_point(display_offset: usize, point: Point<usize>) -> Point {
@@ -82,7 +82,7 @@ pub fn viewport_to_point(display_offset: usize, point: Point<usize>) -> Point {
 
 ### 2.4 单元格侧边判断
 
-**函数**：`alacritty/src/input/mod.rs` 中的 [Processor::cell_side()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L520-L539)
+**函数**：`alacritty/src/input/mod.rs` 中的 [Processor::cell_side()](alacritty/src/input/mod.rs#L520-L539)
 
 用于确定鼠标在单元格的左侧还是右侧，影响选区起点的精确位置：
 
@@ -103,7 +103,7 @@ fn cell_side(&self, x: usize) -> Side {
 
 #### 3.1.1 Cell 中的超链接存储
 
-每个单元格的超链接存储在 `alacritty_terminal/src/term/cell.rs` 中的 [CellExtra](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty_terminal/src/term/cell.rs#L125-L129) 中：
+每个单元格的超链接存储在 `alacritty_terminal/src/term/cell.rs` 中的 [CellExtra](alacritty_terminal/src/term/cell.rs#L125-L129) 中：
 
 ```rust
 pub struct CellExtra {
@@ -117,7 +117,7 @@ pub struct CellExtra {
 
 #### 3.1.2 Hyperlink 结构体
 
-`alacritty_terminal/src/term/cell.rs` 中的 [Hyperlink](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty_terminal/src/term/cell.rs#L42-L98) 包含：
+`alacritty_terminal/src/term/cell.rs` 中的 [Hyperlink](alacritty_terminal/src/term/cell.rs#L42-L98) 包含：
 
 - `id`：超链接标识符（OSC 8 的 id 参数）
 - `uri`：超链接的目标地址
@@ -126,7 +126,7 @@ pub struct CellExtra {
 
 ### 3.2 命中检测入口
 
-**核心函数**：`alacritty/src/display/hint.rs` 中的 [highlighted_at()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/hint.rs#L389-L423)
+**核心函数**：`alacritty/src/display/hint.rs` 中的 [highlighted_at()](alacritty/src/display/hint.rs#L389-L423)
 
 ```rust
 pub fn highlighted_at<T>(
@@ -174,7 +174,7 @@ pub fn highlighted_at<T>(
 
 ### 3.3 OSC 8 超链接命中
 
-**函数**：`alacritty/src/display/hint.rs` 中的 [hyperlink_at()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/hint.rs#L428-L453)
+**函数**：`alacritty/src/display/hint.rs` 中的 [hyperlink_at()](alacritty/src/display/hint.rs#L428-L453)
 
 ```rust
 fn hyperlink_at<T>(term: &Term<T>, point: Point) -> Option<(Hyperlink, Match)> {
@@ -215,7 +215,7 @@ fn hyperlink_at<T>(term: &Term<T>, point: Point) -> Option<(Hyperlink, Match)> {
 
 ### 3.4 正则匹配命中
 
-**函数**：`alacritty/src/display/hint.rs` 中的 [regex_match_at()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/hint.rs#L372-L386)
+**函数**：`alacritty/src/display/hint.rs` 中的 [regex_match_at()](alacritty/src/display/hint.rs#L372-L386)
 
 ```rust
 fn regex_match_at<T>(
@@ -237,13 +237,13 @@ fn regex_match_at<T>(
 
 #### 正则后处理器
 
-`alacritty/src/display/hint.rs` 中的 [HintPostProcessor](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/hint.rs#L456-L589) 提供 URL 智能截断：
+`alacritty/src/display/hint.rs` 中的 [HintPostProcessor](alacritty/src/display/hint.rs#L456-L589) 提供 URL 智能截断：
 - 括号匹配截断（不平衡的括号不包含在 URL 中）
 - 末尾分隔符截断（`.`、`,`、`:` 等）
 
 ### 3.5 HintMatch 高亮判断
 
-**函数**：`alacritty/src/display/hint.rs` 中的 [HintMatch::should_highlight()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/hint.rs#L209-L212)
+**函数**：`alacritty/src/display/hint.rs` 中的 [HintMatch::should_highlight()](alacritty/src/display/hint.rs#L209-L212)
 
 ```rust
 pub fn should_highlight(&self, point: Point, pointed_hyperlink: Option<&Hyperlink>) -> bool {
@@ -262,7 +262,7 @@ pub fn should_highlight(&self, point: Point, pointed_hyperlink: Option<&Hyperlin
 
 ### 4.1 鼠标移动处理
 
-**入口**：`alacritty/src/input/mod.rs` 中的 [Processor::mouse_moved()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L454-L517)
+**入口**：`alacritty/src/input/mod.rs` 中的 [Processor::mouse_moved()](alacritty/src/input/mod.rs#L454-L517)
 
 ```rust
 pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
@@ -311,9 +311,9 @@ pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
 
 ### 4.2 高亮状态更新
 
-**入口**：`alacritty/src/display/mod.rs` 中的 [Display::update_highlighted_hints()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/mod.rs#L1059-L1126)
+**入口**：`alacritty/src/display/mod.rs` 中的 [Display::update_highlighted_hints()](alacritty/src/display/mod.rs#L1059-L1126)
 
-调用时机：在 `alacritty/src/window_context.rs` 的 [WindowContext::handle_event()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/window_context.rs#L475-L483) 中，当 `dirty || mouse.hint_highlight_dirty` 时调用。
+调用时机：在 `alacritty/src/window_context.rs` 的 [WindowContext::handle_event()](alacritty/src/window_context.rs#L475-L483) 中，当 `dirty || mouse.hint_highlight_dirty` 时调用。
 
 ```rust
 pub fn update_highlighted_hints<T>(
@@ -368,7 +368,7 @@ pub fn update_highlighted_hints<T>(
 
 ### 4.3 光标状态判断
 
-**函数**：`alacritty/src/input/mod.rs` 中的 [Processor::cursor_state()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L1096-L1113)
+**函数**：`alacritty/src/input/mod.rs` 中的 [Processor::cursor_state()](alacritty/src/input/mod.rs#L1096-L1113)
 
 ```rust
 fn cursor_state(&mut self) -> CursorIcon {
@@ -393,7 +393,7 @@ fn cursor_state(&mut self) -> CursorIcon {
 
 ### 4.4 渲染高亮
 
-**位置**：`alacritty/src/display/mod.rs` 中的 [Display::draw()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/mod.rs#L858-L877)
+**位置**：`alacritty/src/display/mod.rs` 中的 [Display::draw()](alacritty/src/display/mod.rs#L858-L877)
 
 ```rust
 let cells = grid_cells.into_iter().map(|mut cell| {
@@ -420,7 +420,7 @@ let cells = grid_cells.into_iter().map(|mut cell| {
 
 ### 5.1 核心防误触变量
 
-**`block_hint_launcher`**：定义在 `alacritty/src/event.rs` 的 [Mouse](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/event.rs#L1768-L1782) 结构体中。
+**`block_hint_launcher`**：定义在 `alacritty/src/event.rs` 的 [Mouse](alacritty/src/event.rs#L1768-L1782) 结构体中。
 
 ```rust
 pub struct Mouse {
@@ -437,7 +437,7 @@ pub struct Mouse {
 
 #### 5.2.1 鼠标移动时
 
-**位置**：`alacritty/src/input/mod.rs` 第 498 行 [mouse_moved()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L497-L498)
+**位置**：`alacritty/src/input/mod.rs` 第 498 行 [mouse_moved()](alacritty/src/input/mod.rs#L497-L498)
 
 ```rust
 // Don't launch URLs if mouse has moved.
@@ -452,7 +452,7 @@ self.ctx.mouse_mut().block_hint_launcher = true;
 
 #### 5.2.2 单击（ClickState::Click）
 
-**位置**：`alacritty/src/input/mod.rs` 第 666-667 行 [on_left_click()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L664-L677)
+**位置**：`alacritty/src/input/mod.rs` 第 666-667 行 [on_left_click()](alacritty/src/input/mod.rs#L664-L677)
 
 ```rust
 ClickState::Click => {
@@ -475,7 +475,7 @@ ClickState::Click => {
 
 #### 5.2.3 双击（ClickState::DoubleClick）
 
-**位置**：`alacritty/src/input/mod.rs` 第 678-680 行 [on_left_click()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L678-L681)
+**位置**：`alacritty/src/input/mod.rs` 第 678-680 行 [on_left_click()](alacritty/src/input/mod.rs#L678-L681)
 
 ```rust
 ClickState::DoubleClick if !control => {
@@ -492,7 +492,7 @@ ClickState::DoubleClick if !control => {
 
 #### 5.2.4 三击（ClickState::TripleClick）
 
-**位置**：`alacritty/src/input/mod.rs` 第 682-684 行 [on_left_click()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L682-L685)
+**位置**：`alacritty/src/input/mod.rs` 第 682-684 行 [on_left_click()](alacritty/src/input/mod.rs#L682-L685)
 
 ```rust
 ClickState::TripleClick if !control => {
@@ -521,7 +521,7 @@ ClickState::TripleClick if !control => {
 
 #### 5.2.6 Vi 模式打开超链接
 
-**位置**：`alacritty/src/input/mod.rs` 第 204-211 行 [Action::Vi(ViAction::Open)](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/input/mod.rs#L204-L211)
+**位置**：`alacritty/src/input/mod.rs` 第 204-211 行 [Action::Vi(ViAction::Open)](alacritty/src/input/mod.rs#L204-L211)
 
 ```rust
 Action::Vi(ViAction::Open) => {
@@ -614,7 +614,7 @@ input::Processor::mouse_input()
 
 ### 6.3 触发前的实时验证机制
 
-**函数**：`alacritty/src/display/hint.rs` 中的 [HintMatch::text()](file:///d:/fz/0601-2/solo-dogfeeding/code/118-alacritty/alacritty/src/display/hint.rs#L234-L249)
+**函数**：`alacritty/src/display/hint.rs` 中的 [HintMatch::text()](alacritty/src/display/hint.rs#L234-L249)
 
 ```rust
 pub fn text<T>(&self, term: &Term<T>) -> Option<Cow<'_, str>> {
