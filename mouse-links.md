@@ -544,13 +544,13 @@ Action::Vi(ViAction::Open) => {
 
 | 场景 | block_hint_launcher | 能否触发超链接 | 代码位置 |
 |------|---------------------|---------------|---------|
-| 鼠标移动 | true | 不能 | `input/mod.rs:498` |
-| 单击（原无选区） | false | 能 | `input/mod.rs:667` |
-| 单击（原有选区） | true | 不能 | `input/mod.rs:667` |
-| 双击 | true | 不能 | `input/mod.rs:679` |
-| 三击 | true | 不能 | `input/mod.rs:683` |
-| 拖动选择 | true | 不能 | `input/mod.rs:498` |
-| Vi 模式 Open | false（主动重置） | 能 | `input/mod.rs:207` |
+| 鼠标移动 | true | 不能 | [alacritty/src/input/mod.rs#L498](alacritty/src/input/mod.rs#L498) |
+| 单击（原无选区） | false | 能 | [alacritty/src/input/mod.rs#L667](alacritty/src/input/mod.rs#L667) |
+| 单击（原有选区） | true | 不能 | [alacritty/src/input/mod.rs#L667](alacritty/src/input/mod.rs#L667) |
+| 双击 | true | 不能 | [alacritty/src/input/mod.rs#L679](alacritty/src/input/mod.rs#L679) |
+| 三击 | true | 不能 | [alacritty/src/input/mod.rs#L683](alacritty/src/input/mod.rs#L683) |
+| 拖动选择 | true | 不能 | [alacritty/src/input/mod.rs#L498](alacritty/src/input/mod.rs#L498) |
+| Vi 模式 Open | false（主动重置） | 能 | [alacritty/src/input/mod.rs#L207](alacritty/src/input/mod.rs#L207) |
 
 ---
 
@@ -586,7 +586,7 @@ Action::Vi(ViAction::Open) => {
 ```
 winit MouseInput (Pressed)
     ↓
-input::Processor::mouse_input()
+alacritty/src/input/mod.rs - Processor::mouse_input()
     ├─ 更新按钮状态
     ├─ 消息栏点击检查（如果点在消息栏，不走下面的流程）
     └─ on_mouse_press(button)
@@ -599,7 +599,7 @@ input::Processor::mouse_input()
 
 winit MouseInput (Released)
     ↓
-input::Processor::mouse_input()
+alacritty/src/input/mod.rs - Processor::mouse_input()
     ├─ 更新按钮状态
     └─ on_mouse_release(button)
         ├─ 鼠标模式处理
@@ -751,7 +751,7 @@ alacritty/src/config/ui_config.rs - Hint
 ```
 1. winit::WindowEvent::CursorMoved
    ↓
-2. input::Processor::mouse_moved()   [alacritty/src/input/mod.rs]
+2. alacritty/src/input/mod.rs - Processor::mouse_moved()
    ├─ 坐标换算：像素 → 视口单元格 → 网格坐标
    ├─ 设置 hint_highlight_dirty = true
    ├─ 设置 block_hint_launcher = true
@@ -764,15 +764,15 @@ alacritty/src/config/ui_config.rs - Hint
 ### 8.2 高亮状态更新链路
 
 ```
-1. WindowContext::handle_event() 事件处理后   [alacritty/src/window_context.rs]
+1. alacritty/src/window_context.rs - WindowContext::handle_event() 事件处理后
    ↓
 2. dirty || mouse.hint_highlight_dirty 检查
    ↓
-3. Display::update_highlighted_hints()   [alacritty/src/display/mod.rs]
+3. alacritty/src/display/mod.rs - Display::update_highlighted_hints()
    ├─ Vi 模式高亮（vi_highlighted_hint）
    └─ 鼠标高亮
       ├─ 前置检查：可见/在文本区/无选区
-      └─ hint::highlighted_at()   [alacritty/src/display/hint.rs]
+      └─ alacritty/src/display/hint.rs - highlighted_at()
          ├─ 修饰键检查
          ├─ hyperlink_at() 超链接命中（优先）
          └─ regex_match_at() 正则命中
@@ -788,13 +788,13 @@ alacritty/src/config/ui_config.rs - Hint
 ```
 1. winit::WindowEvent::MouseInput (Released)
    ↓
-2. input::Processor::mouse_input()   [alacritty/src/input/mod.rs]
+2. alacritty/src/input/mod.rs - Processor::mouse_input()
    ↓
 3. on_mouse_release(button)
    ├─ 取出 highlighted_hint
    ├─ 检查：左键按钮
    ├─ 检查：block_hint_launcher == false
-   └─ 调用 ctx.trigger_hint(hint)   [alacritty/src/event.rs]
+   └─ 调用 alacritty/src/event.rs - ActionContext::trigger_hint()
       ├─ 再次检查 block_hint_launcher（第一道防线）
       ├─ hint.text() 重新验证匹配（第二道防线）
       │   ├─ 超链接类型：重新调用 hyperlink_at()
@@ -812,7 +812,7 @@ alacritty/src/config/ui_config.rs - Hint
 ```
 1. winit::WindowEvent::RedrawRequested
    ↓
-2. Display::draw()   [alacritty/src/display/mod.rs]
+2. alacritty/src/display/mod.rs - Display::draw()
    ├─ has_highlighted_hint 检查
    ├─ 遍历所有可渲染单元格
    │  └─ 对每个 cell：
